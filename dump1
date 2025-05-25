@@ -1,0 +1,885 @@
+cmake_minimum_required(VERSION 3.14)
+project(ArrowFlightModule)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Cross-platform configuration
+if(WIN32)
+    # Windows-specific settings
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    add_definitions(-DNOMINMAX)  # Avoid min/max macro conflicts
+elseif(APPLE)
+    # macOS-specific settings
+    set(CMAKE_MACOSX_RPATH ON)
+    set(CMAKE_INSTALL_RPATH "@loader_path")
+else()
+    # Linux-specific settings
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+endif()
+
+# Find required packages
+find_package(Python REQUIRED COMPONENTS Interpreter Development)
+find_package(pybind11 CONFIG REQUIRED)
+find_package(GTest CONFIG REQUIRED)
+find_package(Arrow CONFIG REQUIRED)
+find_package(ArrowFlight CONFIG REQUIRED)
+
+# Set include directories
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${ARROW_INCLUDE_DIR}
+)
+
+# Define source files
+set(SOURCES
+    src/flight_module.cpp
+    src/flight_service.cpp
+)
+
+# Create Python module
+pybind11_add_module(flight_module ${SOURCES})
+
+# Link libraries
+target_link_libraries(flight_module PRIVATE
+    Arrow::arrow_shared
+    Arrow::arrow_flight_shared
+)
+
+# Tests
+enable_testing()
+add_executable(flight_tests tests/test_main.cpp tests/test_flight.cpp)
+target_link_libraries(flight_tests PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+    Arrow::arrow_shared
+    Arrow::arrow_flight_shared
+)
+
+# Add tests
+add_test(NAME flight_unit_tests COMMAND flight_tests)
+
+# Installation
+install(TARGETS flight_module
+        LIBRARY DESTINATION ${PYTHON_SITE_PACKAGES}
+        RUNTIME DESTINATION ${PYTHON_SITE_PACKAGES})
+
+
+#pragma once
+
+#include <arrow/flight/api.h>
+#include <string>
+
+class FlightService {
+public:
+    FlightService();
+    std::string getFlightInfo();
+    arrow::Result<std::shared_ptr<arrow::Table>> getFlightData();
+};
+
+
+#include "flight_service.h"
+
+FlightService::FlightService() {}
+
+std::string FlightService::getFlightInfo() {
+    return "Flight service information";
+}
+
+arrow::Result<std::shared_ptr<arrow::Table>> FlightService::getFlightData() {
+    // Create a simple Arrow table
+    auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                arrow::field("name", arrow::utf8())});
+    
+    auto id_array = arrow::Int32Array::FromJSON("[1, 2, 3, 4, 5]");
+    auto name_array = arrow::StringArray::FromJSON("[\"a\", \"b\", \"c\", \"d\", \"e\"]");
+    
+    return arrow::Table::Make(schema, {id_array.ValueOrDie(), name_array.ValueOrDie()});
+}
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include "flight_service.h"
+
+namespace py = pybind11;
+
+PYBIND11_MODULE(flight_module, m) {
+    m.doc() = "Arrow Flight Python bindings";
+    
+    py::class_<FlightService>(m, "FlightService")
+        .def(py::init<>())
+        .def("get_flight_info", &FlightService::getFlightInfo)
+        .def("get_flight_data", [](FlightService& service) {
+            auto result = service.getFlightData();
+            if (!result.ok()) {
+                throw std::runtime_error(result.status().ToString());
+            }
+            // Here you would convert Arrow Table to Python object
+            return py::cast(result.ValueOrDie());
+        });
+}
+#!/bin/bash
+mkdir -p build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_INSTALL_PREFIX=$(python -c "import site; print(site.getsitepackages()[0])")
+make -j$(nproc)
+make install
+
+mkdir build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release ^
+         -DCMAKE_INSTALL_PREFIX=$(python -c "import site; print(site.getsitepackages()[0])")
+cmake --build . --config Release
+cmake --install . --config Release
+
+import flight_module
+
+# Create an instance of the FlightService
+service = flight_module.FlightService()
+
+# Get flight info
+info = service.get_flight_info()
+print(f"Flight Info: {info}")
+
+# Get flight data
+data = service.get_flight_data()
+print(f"Flight Data: {data}")
+
+# Create a new conda environment with debug symbols
+conda create -n arrow_env_debug python=3.10
+conda activate arrow_env_debug
+
+# Install packages with debug symbols
+conda install -c conda-forge pyarrow arrow-cpp=14.0.1 
+conda install -c conda-forge pyarrow-flight=14.0.1
+conda install -c conda-forge gtest cmake pybind11
+
+# Install memory profiling tools
+conda install -c conda-forge memory_profiler py-spy
+conda install -c conda-forge pytest pytest-memray
+pip install pympler
+
+cmake_minimum_required(VERSION 3.14)
+project(ArrowFlightModule)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Debug configuration
+option(ENABLE_MEMORY_DEBUG "Enable memory debugging" OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR ENABLE_MEMORY_DEBUG)
+    add_definitions(-DMEMORY_DEBUG)
+    # Add debug symbols even in release mode if memory debugging is enabled
+    add_compile_options(-g)
+endif()
+
+# Cross-platform configuration
+if(WIN32)
+    # Windows-specific settings
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+    add_definitions(-DNOMINMAX)
+    if(ENABLE_MEMORY_DEBUG)
+        # Windows debug heap options
+        add_definitions(-D_CRTDBG_MAP_ALLOC)
+    endif()
+elseif(APPLE)
+    # macOS-specific settings
+    set(CMAKE_MACOSX_RPATH ON)
+    set(CMAKE_INSTALL_RPATH "@loader_path")
+    if(ENABLE_MEMORY_DEBUG)
+        # Add macOS-specific debug flags
+        add_compile_options(-fsanitize=address)
+        add_link_options(-fsanitize=address)
+    endif()
+else()
+    # Linux-specific settings
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+    if(ENABLE_MEMORY_DEBUG)
+        # Add Linux-specific debug flags
+        add_compile_options(-fsanitize=address)
+        add_link_options(-fsanitize=address)
+    endif()
+endif()
+
+# Find required packages
+find_package(Python REQUIRED COMPONENTS Interpreter Development)
+find_package(pybind11 CONFIG REQUIRED)
+find_package(GTest CONFIG REQUIRED)
+find_package(Arrow CONFIG REQUIRED)
+find_package(ArrowFlight CONFIG REQUIRED)
+
+# Set include directories
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${ARROW_INCLUDE_DIR}
+)
+
+# Define source files
+set(SOURCES
+    src/flight_module.cpp
+    src/flight_service.cpp
+    src/memory_tracker.cpp
+)
+
+# Create Python module
+pybind11_add_module(flight_module ${SOURCES})
+
+# Link libraries
+target_link_libraries(flight_module PRIVATE
+    Arrow::arrow_shared
+    Arrow::arrow_flight_shared
+)
+
+# Tests
+enable_testing()
+add_executable(flight_tests tests/test_main.cpp tests/test_flight.cpp)
+target_link_libraries(flight_tests PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+    Arrow::arrow_shared
+    Arrow::arrow_flight_shared
+)
+
+# Add tests
+add_test(NAME flight_unit_tests COMMAND flight_tests)
+
+# Installation
+install(TARGETS flight_module
+        LIBRARY DESTINATION ${PYTHON_SITE_PACKAGES}
+        RUNTIME DESTINATION ${PYTHON_SITE_PACKAGES})
+
+#pragma once
+
+#include <cstddef>
+#include <string>
+#include <unordered_map>
+#include <mutex>
+#include <vector>
+#include <chrono>
+
+class MemoryTracker {
+public:
+    static MemoryTracker& getInstance();
+    
+    void recordAllocation(void* ptr, size_t size, const std::string& description);
+    void recordDeallocation(void* ptr);
+    
+    // Stats and reporting
+    size_t getCurrentUsage() const;
+    size_t getPeakUsage() const;
+    void printReport() const;
+    
+    // Snapshot functions
+    struct MemorySnapshot {
+        std::chrono::system_clock::time_point timestamp;
+        size_t totalBytes;
+        std::unordered_map<std::string, size_t> categoryBytes;
+    };
+    
+    int takeSnapshot(const std::string& label = "");
+    MemorySnapshot getSnapshot(int id) const;
+    std::vector<MemorySnapshot> getAllSnapshots() const;
+    void clearSnapshots();
+
+private:
+    MemoryTracker();
+    ~MemoryTracker();
+    
+    struct AllocationInfo {
+        size_t size;
+        std::string description;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    
+    std::unordered_map<void*, AllocationInfo> allocations_;
+    std::vector<MemorySnapshot> snapshots_;
+    size_t currentBytes_;
+    size_t peakBytes_;
+    mutable std::mutex mutex_;
+};
+
+// Helper macros for memory tracking
+#ifdef MEMORY_DEBUG
+    #define TRACK_ALLOC(ptr, size, desc) MemoryTracker::getInstance().recordAllocation(ptr, size, desc)
+    #define TRACK_DEALLOC(ptr) MemoryTracker::getInstance().recordDeallocation(ptr)
+    #define MEMORY_SNAPSHOT(label) MemoryTracker::getInstance().takeSnapshot(label)
+    #define MEMORY_REPORT() MemoryTracker::getInstance().printReport()
+#else
+    #define TRACK_ALLOC(ptr, size, desc) 
+    #define TRACK_DEALLOC(ptr)
+    #define MEMORY_SNAPSHOT(label) 0
+    #define MEMORY_REPORT()
+#endif
+
+#include "memory_tracker.h"
+#include <iostream>
+#include <iomanip>
+#include <algorithm>
+#include <numeric>
+
+MemoryTracker& MemoryTracker::getInstance() {
+    static MemoryTracker instance;
+    return instance;
+}
+
+MemoryTracker::MemoryTracker() 
+    : currentBytes_(0), peakBytes_(0) {}
+
+MemoryTracker::~MemoryTracker() {}
+
+void MemoryTracker::recordAllocation(void* ptr, size_t size, const std::string& description) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    allocations_[ptr] = {
+        size,
+        description,
+        std::chrono::system_clock::now()
+    };
+    
+    currentBytes_ += size;
+    peakBytes_ = std::max(peakBytes_, currentBytes_);
+}
+
+void MemoryTracker::recordDeallocation(void* ptr) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    auto it = allocations_.find(ptr);
+    if (it != allocations_.end()) {
+        currentBytes_ -= it->second.size;
+        allocations_.erase(it);
+    }
+}
+
+size_t MemoryTracker::getCurrentUsage() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return currentBytes_;
+}
+
+size_t MemoryTracker::getPeakUsage() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return peakBytes_;
+}
+
+int MemoryTracker::takeSnapshot(const std::string& label) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    MemorySnapshot snapshot;
+    snapshot.timestamp = std::chrono::system_clock::now();
+    snapshot.totalBytes = currentBytes_;
+    
+    // Group allocations by description
+    for (const auto& pair : allocations_) {
+        snapshot.categoryBytes[pair.second.description] += pair.second.size;
+    }
+    
+    snapshots_.push_back(snapshot);
+    return static_cast<int>(snapshots_.size() - 1);
+}
+
+MemoryTracker::MemorySnapshot MemoryTracker::getSnapshot(int id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (id >= 0 && id < static_cast<int>(snapshots_.size())) {
+        return snapshots_[id];
+    }
+    return MemorySnapshot{};
+}
+
+std::vector<MemoryTracker::MemorySnapshot> MemoryTracker::getAllSnapshots() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshots_;
+}
+
+void MemoryTracker::clearSnapshots() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshots_.clear();
+}
+
+void MemoryTracker::printReport() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    std::cout << "===== Memory Usage Report =====" << std::endl;
+    std::cout << "Current memory usage: " << (currentBytes_ / 1024.0) << " KB" << std::endl;
+    std::cout << "Peak memory usage: " << (peakBytes_ / 1024.0) << " KB" << std::endl;
+    std::cout << "Number of active allocations: " << allocations_.size() << std::endl;
+    
+    // Group by description
+    std::unordered_map<std::string, size_t> byDescription;
+    for (const auto& pair : allocations_) {
+        byDescription[pair.second.description] += pair.second.size;
+    }
+    
+    std::cout << "\nMemory Usage by Category:" << std::endl;
+    std::cout << std::left << std::setw(50) << "Description" 
+              << std::right << std::setw(15) << "Size (KB)" 
+              << std::right << std::setw(15) << "Percentage" << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+    
+    for (const auto& pair : byDescription) {
+        double percentage = (currentBytes_ > 0) ? (100.0 * pair.second / currentBytes_) : 0.0;
+        std::cout << std::left << std::setw(50) << pair.first 
+                  << std::right << std::setw(15) << (pair.second / 1024.0) 
+                  << std::right << std::setw(15) << std::fixed << std::setprecision(2) << percentage << "%" << std::endl;
+    }
+    
+    std::cout << std::string(80, '-') << std::endl;
+}
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include "flight_service.h"
+#include "memory_tracker.h"
+
+namespace py = pybind11;
+
+// Custom allocator that tracks memory
+class TrackedAllocator {
+public:
+    // Allocate memory and track it
+    static void* allocate(size_t size) {
+        void* ptr = std::malloc(size);
+        TRACK_ALLOC(ptr, size, "PyBind11 Allocation");
+        return ptr;
+    }
+    
+    // Deallocate memory and update tracking
+    static void deallocate(void* ptr) {
+        TRACK_DEALLOC(ptr);
+        std::free(ptr);
+    }
+};
+
+PYBIND11_MODULE(flight_module, m) {
+    m.doc() = "Arrow Flight Python bindings with memory tracking";
+    
+    py::class_<FlightService>(m, "FlightService")
+        .def(py::init<>())
+        .def("get_flight_info", &FlightService::getFlightInfo)
+        .def("get_flight_data", [](FlightService& service) {
+            int snapshotId = MEMORY_SNAPSHOT("Before get_flight_data");
+            
+            auto result = service.getFlightData();
+            if (!result.ok()) {
+                throw std::runtime_error(result.status().ToString());
+            }
+            
+            MEMORY_SNAPSHOT("After get_flight_data");
+            
+            // Here you would convert Arrow Table to Python object
+            return py::cast(result.ValueOrDie());
+        });
+    
+    // Expose memory tracking functions to Python
+    py::class_<MemoryTracker>(m, "MemoryTracker")
+        .def_static("get_instance", &MemoryTracker::getInstance, py::return_value_policy::reference)
+        .def("get_current_usage", &MemoryTracker::getCurrentUsage)
+        .def("get_peak_usage", &MemoryTracker::getPeakUsage)
+        .def("print_report", &MemoryTracker::printReport)
+        .def("take_snapshot", &MemoryTracker::takeSnapshot)
+        .def("clear_snapshots", &MemoryTracker::clearSnapshots)
+        .def("get_all_snapshots", [](MemoryTracker& tracker) {
+            auto snapshots = tracker.getAllSnapshots();
+            py::list result;
+            
+            for (const auto& snapshot : snapshots) {
+                py::dict sDict;
+                // Convert timestamp to Python datetime
+                auto time_t = std::chrono::system_clock::to_time_t(snapshot.timestamp);
+                sDict["timestamp"] = py::cast(time_t);
+                sDict["total_bytes"] = py::cast(snapshot.totalBytes);
+                
+                py::dict categories;
+                for (const auto& cat : snapshot.categoryBytes) {
+                    categories[py::cast(cat.first).ptr()] = py::cast(cat.second);
+                }
+                sDict["categories"] = categories;
+                
+                result.append(sDict);
+            }
+            
+            return result;
+        });
+    
+    // Add functions for explicit memory testing
+    m.def("create_test_objects", [](size_t numObjects, size_t sizePerObject) {
+        std::vector<std::vector<uint8_t>> objects;
+        for (size_t i = 0; i < numObjects; i++) {
+            auto vec = std::vector<uint8_t>(sizePerObject, 0);
+            TRACK_ALLOC(vec.data(), sizePerObject, "Test Object");
+            objects.push_back(std::move(vec));
+        }
+        return objects;
+    });
+    
+    m.def("force_gc", []() {
+        py::gil_scoped_acquire acquire;
+        py::module::import("gc").attr("collect")();
+    });
+}
+
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
+#include "flight_service.h"
+#include "memory_tracker.h"
+
+namespace py = pybind11;
+
+// Custom allocator that tracks memory
+class TrackedAllocator {
+public:
+    // Allocate memory and track it
+    static void* allocate(size_t size) {
+        void* ptr = std::malloc(size);
+        TRACK_ALLOC(ptr, size, "PyBind11 Allocation");
+        return ptr;
+    }
+    
+    // Deallocate memory and update tracking
+    static void deallocate(void* ptr) {
+        TRACK_DEALLOC(ptr);
+        std::free(ptr);
+    }
+};
+
+PYBIND11_MODULE(flight_module, m) {
+    m.doc() = "Arrow Flight Python bindings with memory tracking";
+    
+    py::class_<FlightService>(m, "FlightService")
+        .def(py::init<>())
+        .def("get_flight_info", &FlightService::getFlightInfo)
+        .def("get_flight_data", [](FlightService& service) {
+            int snapshotId = MEMORY_SNAPSHOT("Before get_flight_data");
+            
+            auto result = service.getFlightData();
+            if (!result.ok()) {
+                throw std::runtime_error(result.status().ToString());
+            }
+            
+            MEMORY_SNAPSHOT("After get_flight_data");
+            
+            // Here you would convert Arrow Table to Python object
+            return py::cast(result.ValueOrDie());
+        });
+    
+    // Expose memory tracking functions to Python
+    py::class_<MemoryTracker>(m, "MemoryTracker")
+        .def_static("get_instance", &MemoryTracker::getInstance, py::return_value_policy::reference)
+        .def("get_current_usage", &MemoryTracker::getCurrentUsage)
+        .def("get_peak_usage", &MemoryTracker::getPeakUsage)
+        .def("print_report", &MemoryTracker::printReport)
+        .def("take_snapshot", &MemoryTracker::takeSnapshot)
+        .def("clear_snapshots", &MemoryTracker::clearSnapshots)
+        .def("get_all_snapshots", [](MemoryTracker& tracker) {
+            auto snapshots = tracker.getAllSnapshots();
+            py::list result;
+            
+            for (const auto& snapshot : snapshots) {
+                py::dict sDict;
+                // Convert timestamp to Python datetime
+                auto time_t = std::chrono::system_clock::to_time_t(snapshot.timestamp);
+                sDict["timestamp"] = py::cast(time_t);
+                sDict["total_bytes"] = py::cast(snapshot.totalBytes);
+                
+                py::dict categories;
+                for (const auto& cat : snapshot.categoryBytes) {
+                    categories[py::cast(cat.first).ptr()] = py::cast(cat.second);
+                }
+                sDict["categories"] = categories;
+                
+                result.append(sDict);
+            }
+            
+            return result;
+        });
+    
+    // Add functions for explicit memory testing
+    m.def("create_test_objects", [](size_t numObjects, size_t sizePerObject) {
+        std::vector<std::vector<uint8_t>> objects;
+        for (size_t i = 0; i < numObjects; i++) {
+            auto vec = std::vector<uint8_t>(sizePerObject, 0);
+            TRACK_ALLOC(vec.data(), sizePerObject, "Test Object");
+            objects.push_back(std::move(vec));
+        }
+        return objects;
+    });
+    
+    m.def("force_gc", []() {
+        py::gil_scoped_acquire acquire;
+        py::module::import("gc").attr("collect")();
+    });
+}
+
+import gc
+import time
+import tracemalloc
+import os
+import sys
+import matplotlib.pyplot as plt
+import numpy as np
+from pympler import muppy, summary
+from memory_profiler import profile
+import flight_module
+
+class MemoryProfiler:
+    def __init__(self):
+        self.snapshots = []
+        
+    def start_tracking(self):
+        """Start tracking memory usage with tracemalloc"""
+        tracemalloc.start()
+        
+    def take_snapshot(self, label=""):
+        """Take a snapshot of current memory usage"""
+        snapshot = tracemalloc.take_snapshot()
+        self.snapshots.append((label, snapshot))
+        return len(self.snapshots) - 1
+        
+    def compare_snapshots(self, snapshot1_idx, snapshot2_idx):
+        """Compare two snapshots and show memory differences"""
+        if not (0 <= snapshot1_idx < len(self.snapshots) and 
+                0 <= snapshot2_idx < len(self.snapshots)):
+            print("Invalid snapshot indices")
+            return
+            
+        snapshot1 = self.snapshots[snapshot1_idx][1]
+        snapshot2 = self.snapshots[snapshot2_idx][1]
+        
+        top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+        
+        print(f"\nMemory difference between {self.snapshots[snapshot1_idx][0]} "
+              f"and {self.snapshots[snapshot2_idx][0]}:")
+        for stat in top_stats[:10]:
+            print(f"{stat.size_diff / 1024:.1f} KB: {stat.traceback.format()[0]}")
+    
+    def print_extension_stats(self):
+        """Print memory stats from the C++ extension"""
+        flight_module.MemoryTracker.get_instance().print_report()
+    
+    def plot_memory_timeline(self):
+        """Plot memory usage over time from C++ extension snapshots"""
+        snapshots = flight_module.MemoryTracker.get_instance().get_all_snapshots()
+        
+        if not snapshots:
+            print("No memory snapshots available")
+            return
+            
+        times = [snap["timestamp"] for snap in snapshots]
+        memory = [snap["total_bytes"] / 1024.0 for snap in snapshots]  # KB
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(times, memory, marker='o')
+        plt.xlabel('Time')
+        plt.ylabel('Memory Usage (KB)')
+        plt.title('Memory Usage Over Time')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('memory_timeline.png')
+        print(f"Memory timeline saved to {os.path.abspath('memory_timeline.png')}")
+        
+    def plot_memory_categories(self, snapshot_idx=-1):
+        """Plot memory usage by category for a specific snapshot"""
+        snapshots = flight_module.MemoryTracker.get_instance().get_all_snapshots()
+        
+        if not snapshots:
+            print("No memory snapshots available")
+            return
+            
+        if snapshot_idx < 0:
+            snapshot_idx = len(snapshots) + snapshot_idx
+            
+        if not (0 <= snapshot_idx < len(snapshots)):
+            print("Invalid snapshot index")
+            return
+            
+        snapshot = snapshots[snapshot_idx]
+        categories = snapshot["categories"]
+        
+        labels = list(categories.keys())
+        sizes = [size / 1024.0 for size in categories.values()]  # KB
+        
+        plt.figure(figsize=(10, 6))
+        plt.pie(sizes, labels=labels, autopct='%1.1f%%')
+        plt.axis('equal')
+        plt.title('Memory Usage by Category')
+        plt.tight_layout()
+        plt.savefig('memory_categories.png')
+        print(f"Memory categories chart saved to {os.path.abspath('memory_categories.png')}")
+
+# Function to run a memory-profiled test
+@profile
+def test_flight_module_memory():
+    profiler = MemoryProfiler()
+    profiler.start_tracking()
+    
+    # Take a baseline snapshot
+    baseline_idx = profiler.take_snapshot("Baseline")
+    
+    # Create flight service and record memory snapshot
+    service = flight_module.FlightService()
+    after_init_idx = profiler.take_snapshot("After Initialization")
+    
+    # Create some test objects to observe memory usage
+    test_objects = flight_module.create_test_objects(10000, 1000)  # 10MB of test data
+    after_test_objects_idx = profiler.take_snapshot("After Test Objects")
+    
+    # Get flight data
+    flight_data = service.get_flight_data()
+    after_flight_data_idx = profiler.take_snapshot("After Flight Data")
+    
+    # Force garbage collection
+    flight_module.force_gc()
+    gc.collect()
+    after_gc_idx = profiler.take_snapshot("After GC")
+    
+    # Print memory comparisons
+    profiler.compare_snapshots(baseline_idx, after_init_idx)
+    profiler.compare_snapshots(after_init_idx, after_test_objects_idx)
+    profiler.compare_snapshots(after_test_objects_idx, after_flight_data_idx)
+    profiler.compare_snapshots(after_flight_data_idx, after_gc_idx)
+    
+    # Print stats from the C++ extension
+    profiler.print_extension_stats()
+    
+    # Plot memory usage
+    profiler.plot_memory_timeline()
+    profiler.plot_memory_categories()
+    
+    return "Memory profiling completed"
+
+if __name__ == "__main__":
+    test_flight_module_memory()
+
+
+#!/bin/bash
+# Enable debug mode by default
+DEBUG_MODE=1
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        --no-debug)
+        DEBUG_MODE=0
+        shift
+        ;;
+        *)
+        shift
+        ;;
+    esac
+done
+
+mkdir -p build
+cd build
+
+# Set build type based on debug mode
+if [ $DEBUG_MODE -eq 1 ]; then
+    echo "Building with memory debugging enabled..."
+    BUILD_TYPE="Debug"
+    MEMORY_DEBUG="-DENABLE_MEMORY_DEBUG=ON"
+else
+    echo "Building in release mode..."
+    BUILD_TYPE="Release"
+    MEMORY_DEBUG=""
+fi
+
+# Get Python site-packages directory
+SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+
+# Configure and build
+cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+         $MEMORY_DEBUG \
+         -DCMAKE_INSTALL_PREFIX=$SITE_PACKAGES
+
+# Use nproc on Linux, sysctl on macOS to determine number of cores
+if [[ "$(uname)" == "Darwin" ]]; then
+    CORES=$(sysctl -n hw.ncpu)
+else
+    CORES=$(nproc)
+fi
+
+# Build and install
+make -j$CORES
+make install
+
+echo "Build complete. Module installed to $SITE_PACKAGES"
+
+@echo off
+REM Enable debug mode by default
+set DEBUG_MODE=1
+
+REM Parse command line arguments
+:parse_args
+if "%~1"=="" goto end_parse_args
+if "%~1"=="--no-debug" set DEBUG_MODE=0
+shift
+goto parse_args
+:end_parse_args
+
+mkdir build 2>nul
+cd build
+
+REM Set build type based on debug mode
+if %DEBUG_MODE%==1 (
+    echo Building with memory debugging enabled...
+    set BUILD_TYPE=Debug
+    set MEMORY_DEBUG=-DENABLE_MEMORY_DEBUG=ON
+) else (
+    echo Building in release mode...
+    set BUILD_TYPE=Release
+    set MEMORY_DEBUG=
+)
+
+REM Get Python site-packages directory
+for /f "tokens=*" %%i in ('python -c "import site; print(site.getsitepackages()[0])"') do set SITE_PACKAGES=%%i
+
+REM Configure and build
+cmake .. -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
+         %MEMORY_DEBUG% ^
+         -DCMAKE_INSTALL_PREFIX=%SITE_PACKAGES%
+
+REM Build and install
+cmake --build . --config %BUILD_TYPE% -j %NUMBER_OF_PROCESSORS%
+cmake --install . --config %BUILD_TYPE%
+
+echo Build complete. Module installed to %SITE_PACKAGES%
+cd ..
+
+import flight_module
+import memory_debug
+import matplotlib.pyplot as plt
+
+# Initialize memory tracking
+tracker = flight_module.MemoryTracker.get_instance()
+
+# Take baseline snapshot
+baseline_id = tracker.take_snapshot("Baseline")
+
+# Create flight service
+service = flight_module.FlightService()
+init_id = tracker.take_snapshot("After initialization")
+
+# Generate some test data
+test_objects = flight_module.create_test_objects(5000, 2000)  # 10MB
+after_alloc_id = tracker.take_snapshot("After allocation")
+
+# Get flight data
+data = service.get_flight_data()
+after_data_id = tracker.take_snapshot("After data retrieval")
+
+# Force garbage collection
+flight_module.force_gc()
+after_gc_id = tracker.take_snapshot("After garbage collection")
+
+# Print memory report
+tracker.print_report()
+
+# Use the memory_debug utility to visualize memory usage
+profiler = memory_debug.MemoryProfiler()
+profiler.plot_memory_timeline()
+profiler.plot_memory_categories()
