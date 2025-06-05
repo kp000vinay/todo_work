@@ -883,3 +883,499 @@ tracker.print_report()
 profiler = memory_debug.MemoryProfiler()
 profiler.plot_memory_timeline()
 profiler.plot_memory_categories()
+
+
+#!/usr/bin/env python3
+"""
+BookKeeper Sample: Inter-Process Object Transfer Demo
+
+This sample demonstrates how BookKeeper works as a central service that:
+1. Manages multiple processes
+2. Allows processes to register objects
+3. Enables object transfer between processes
+4. Executes code in different processes with specific contexts
+"""
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import multiprocessing as mp
+from typing import Dict, List, Any, Optional, Union
+
+# Mock implementation of the BookKeeper Python client
+# In a real implementation, this would connect to the C++ BookKeeper service
+class BookKeeper:
+    def __init__(self, host: str = "localhost", port: int = 50051):
+        """Initialize the BookKeeper client.
+        
+        Args:
+            host: The hostname of the BookKeeper server
+            port: The port of the BookKeeper server
+        """
+        print(f"Connecting to BookKeeper server at {host}:{port}")
+        self.host = host
+        self.port = port
+        self.processes: Dict[str, "Process"] = {}
+        self.objects: Dict[str, Any] = {}
+        self.contexts: Dict[str, "Context"] = {}
+        
+        # In a real implementation, this would establish a gRPC connection
+        # to the BookKeeper server
+        self._server_connection = None
+        
+    def initialize(self) -> None:
+        """Initialize the BookKeeper client."""
+        print("Initializing BookKeeper client")
+        # In a real implementation, this would initialize the connection
+        # and authenticate with the server
+        
+    def create_process(self, name: str, env_vars: Optional[Dict[str, str]] = None) -> str:
+        """Create a new process managed by BookKeeper.
+        
+        Args:
+            name: The name of the process
+            env_vars: Environment variables to set for the process
+            
+        Returns:
+            The process ID
+        """
+        print(f"Creating process: {name}")
+        process_id = f"process_{len(self.processes) + 1}"
+        self.processes[process_id] = Process(self, process_id, name, env_vars or {})
+        return process_id
+    
+    def get_process(self, process_id: str) -> "Process":
+        """Get a process by ID.
+        
+        Args:
+            process_id: The ID of the process
+            
+        Returns:
+            The Process object
+        """
+        if process_id not in self.processes:
+            raise ValueError(f"Process {process_id} not found")
+        return self.processes[process_id]
+    
+    def list_processes(self) -> List[str]:
+        """List all processes managed by BookKeeper.
+        
+        Returns:
+            A list of process IDs
+        """
+        return list(self.processes.keys())
+    
+    def get_context(self, context_name: str) -> Optional["Context"]:
+        """Get or create an execution context.
+        
+        Args:
+            context_name: The name of the context
+            
+        Returns:
+            The Context object, or None if it doesn't exist
+        """
+        return self.contexts.get(context_name)
+    
+    def create_context(self, context_name: str) -> "Context":
+        """Create a new execution context.
+        
+        Args:
+            context_name: The name of the context
+            
+        Returns:
+            The new Context object
+        """
+        print(f"Creating context: {context_name}")
+        context = Context(self, context_name)
+        self.contexts[context_name] = context
+        return context
+    
+    def register_object(self, obj: Any, name: str, namespace: str = "default") -> str:
+        """Register an object with BookKeeper.
+        
+        Args:
+            obj: The object to register
+            name: The name of the object
+            namespace: The namespace for the object
+            
+        Returns:
+            The object ID
+        """
+        object_id = f"{namespace}:{name}"
+        print(f"Registering object: {object_id}")
+        self.objects[object_id] = obj
+        return object_id
+    
+    def get_object(self, object_id: str) -> Any:
+        """Get an object by ID.
+        
+        Args:
+            object_id: The ID of the object
+            
+        Returns:
+            The object
+        """
+        if object_id not in self.objects:
+            raise ValueError(f"Object {object_id} not found")
+        print(f"Retrieving object: {object_id}")
+        return self.objects[object_id]
+    
+    def execute(self, process_id: str, code: str, context_name: Optional[str] = None) -> Dict[str, Any]:
+        """Execute code in a specific process.
+        
+        Args:
+            process_id: The ID of the process to execute in
+            code: The Python code to execute
+            context_name: Optional context name to execute within
+            
+        Returns:
+            The execution result
+        """
+        process = self.get_process(process_id)
+        context = None
+        if context_name:
+            context = self.get_context(context_name)
+            if not context:
+                context = self.create_context(context_name)
+        
+        return process.execute(code, context)
+    
+    def shutdown(self) -> None:
+        """Shutdown the BookKeeper client."""
+        print("Shutting down BookKeeper client")
+        # In a real implementation, this would close the connection
+        # and clean up resources
+        for process_id in list(self.processes.keys()):
+            self.processes[process_id].terminate()
+        self.processes.clear()
+        self.objects.clear()
+        self.contexts.clear()
+
+
+class Process:
+    def __init__(self, bookkeeper: BookKeeper, process_id: str, name: str, env_vars: Dict[str, str]):
+        """Initialize a process managed by BookKeeper.
+        
+        Args:
+            bookkeeper: The BookKeeper instance
+            process_id: The ID of the process
+            name: The name of the process
+            env_vars: Environment variables for the process
+        """
+        self.bookkeeper = bookkeeper
+        self.process_id = process_id
+        self.name = name
+        self.env_vars = env_vars
+        self.running = True
+        
+        # In a real implementation, this would be a separate OS process
+        # managed by the BookKeeper server
+        
+    def execute(self, code: str, context: Optional["Context"] = None) -> Dict[str, Any]:
+        """Execute code in this process.
+        
+        Args:
+            code: The Python code to execute
+            context: Optional context to execute within
+            
+        Returns:
+            The execution result
+        """
+        if not self.running:
+            raise RuntimeError(f"Process {self.process_id} is not running")
+        
+        print(f"Executing in process {self.process_id}" + 
+              (f" with context {context.name}" if context else ""))
+        
+        # In a real implementation, this would send the code to the
+        # actual process for execution
+        
+        # For this demo, we'll use a simple exec with a custom globals dict
+        globals_dict = {
+            "np": np,
+            "pd": pd,
+            "bookkeeper": self.bookkeeper,
+            "process_id": self.process_id,
+            "context": context,
+            "os": os,
+            "time": time,
+        }
+        
+        # Add context-specific objects if a context is provided
+        if context:
+            for obj_id, obj in context.objects.items():
+                name = obj_id.split(":")[-1]  # Use the object name as the variable name
+                globals_dict[name] = obj
+        
+        locals_dict = {}
+        
+        try:
+            # Execute the code
+            exec(code, globals_dict, locals_dict)
+            result = {
+                "success": True,
+                "locals": {k: v for k, v in locals_dict.items() if not k.startswith("_")},
+                "process_id": self.process_id,
+                "context_name": context.name if context else None
+            }
+        except Exception as e:
+            result = {
+                "success": False,
+                "error": str(e),
+                "process_id": self.process_id,
+                "context_name": context.name if context else None
+            }
+        
+        return result
+    
+    def terminate(self) -> None:
+        """Terminate this process."""
+        print(f"Terminating process: {self.process_id}")
+        self.running = False
+        # In a real implementation, this would terminate the actual process
+
+
+class Context:
+    def __init__(self, bookkeeper: BookKeeper, name: str):
+        """Initialize an execution context.
+        
+        Args:
+            bookkeeper: The BookKeeper instance
+            name: The name of the context
+        """
+        self.bookkeeper = bookkeeper
+        self.name = name
+        self.objects: Dict[str, Any] = {}
+    
+    def register(self, obj: Any, name: str) -> str:
+        """Register an object in this context.
+        
+        Args:
+            obj: The object to register
+            name: The name of the object
+            
+        Returns:
+            The object ID
+        """
+        object_id = f"{self.name}:{name}"
+        print(f"Registering object in context {self.name}: {name}")
+        self.objects[object_id] = obj
+        return object_id
+    
+    def get(self, name: str) -> Any:
+        """Get an object by name from this context.
+        
+        Args:
+            name: The name of the object
+            
+        Returns:
+            The object
+        """
+        object_id = f"{self.name}:{name}"
+        if object_id not in self.objects:
+            raise ValueError(f"Object {name} not found in context {self.name}")
+        return self.objects[object_id]
+    
+    def execute(self, code: str, process_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute code in this context.
+        
+        Args:
+            code: The Python code to execute
+            process_id: Optional process ID to execute in
+            
+        Returns:
+            The execution result
+        """
+        if not process_id:
+            # Use the first available process
+            process_ids = self.bookkeeper.list_processes()
+            if not process_ids:
+                raise ValueError("No processes available")
+            process_id = process_ids[0]
+        
+        return self.bookkeeper.execute(process_id, code, self.name)
+
+
+def demo_bookkeeper_object_transfer():
+    """Demonstrate how BookKeeper enables object transfer between processes."""
+    print("=" * 80)
+    print("BookKeeper Demo: Inter-Process Object Transfer")
+    print("=" * 80)
+    
+    # Create a BookKeeper instance
+    bk = BookKeeper()
+    bk.initialize()
+    
+    try:
+        # Create two processes
+        process1_id = bk.create_process("data_producer")
+        process2_id = bk.create_process("data_consumer")
+        
+        print("\n1. Create a DataFrame in process1")
+        result1 = bk.execute(process1_id, """
+# Create a sample DataFrame
+df = pd.DataFrame({
+    'A': np.random.rand(5),
+    'B': np.random.rand(5),
+    'C': np.random.randint(0, 10, 5)
+})
+print(f"Created DataFrame in {process_id}:")
+print(df)
+
+# Register the DataFrame with BookKeeper
+object_id = bookkeeper.register_object(df, "sample_dataframe")
+print(f"Registered DataFrame with ID: {object_id}")
+        """)
+        
+        if not result1["success"]:
+            print(f"Error in process1: {result1['error']}")
+            return
+        
+        print("\n2. Retrieve and modify the DataFrame in process2")
+        result2 = bk.execute(process2_id, """
+# Get the DataFrame from BookKeeper
+df = bookkeeper.get_object("default:sample_dataframe")
+print(f"Retrieved DataFrame in {process_id}:")
+print(df)
+
+# Modify the DataFrame
+df['D'] = df['A'] + df['B']
+print("Modified DataFrame:")
+print(df)
+
+# Register the modified DataFrame
+object_id = bookkeeper.register_object(df, "modified_dataframe")
+print(f"Registered modified DataFrame with ID: {object_id}")
+        """)
+        
+        if not result2["success"]:
+            print(f"Error in process2: {result2['error']}")
+            return
+        
+        print("\n3. Use contexts for object management")
+        # Create a context
+        context = bk.create_context("analysis_context")
+        
+        # Register objects in the context
+        df = bk.get_object("default:modified_dataframe")
+        context.register(df, "input_data")
+        
+        # Execute code in the context
+        result3 = context.execute("""
+# The DataFrame is already available as input_data
+print(f"Working with DataFrame in context {context.name}:")
+print(input_data)
+
+# Perform analysis
+summary = {
+    'mean': input_data.mean().to_dict(),
+    'sum': input_data.sum().to_dict(),
+    'count': len(input_data)
+}
+print("Analysis results:")
+print(summary)
+
+# Register the results in the context
+context.register(summary, "analysis_results")
+        """, process1_id)
+        
+        if not result3["success"]:
+            print(f"Error in context execution: {result3['error']}")
+            return
+        
+        print("\n4. Access context objects from another process")
+        result4 = bk.execute(process2_id, """
+# Get the context
+context = bookkeeper.get_context("analysis_context")
+if not context:
+    print("Context not found")
+else:
+    # Get the analysis results
+    results = context.get("analysis_results")
+    print(f"Retrieved analysis results in {process_id}:")
+    print(results)
+    
+    # Create a visualization (simulated)
+    print("Creating visualization based on analysis results...")
+    for key, value in results['mean'].items():
+        print(f"Column {key}: {'*' * int(value * 10)}")
+        """)
+        
+        if not result4["success"]:
+            print(f"Error accessing context: {result4['error']}")
+            return
+        
+        print("\n5. Execute code with dependencies between processes")
+        # Create a new context for a workflow
+        workflow = bk.create_context("workflow_context")
+        
+        # Step 1: Generate data in process1
+        workflow.execute("""
+import numpy as np
+
+# Generate time series data
+timestamps = pd.date_range('2025-01-01', periods=100, freq='D')
+values = np.sin(np.linspace(0, 10, 100)) + np.random.normal(0, 0.1, 100)
+
+
+time_series = pd.DataFrame({
+    'timestamp': timestamps,
+    'value': values
+})
+
+# Register in the workflow context
+context.register(time_series, "time_series_data")
+print(f"Generated time series data in {process_id}")
+print(time_series.head())
+        """, process1_id)
+        
+        # Step 2: Process data in process2
+        workflow.execute("""
+# The time series data is available in the context
+data = context.get("time_series_data")
+
+# Process the data - calculate rolling average
+data['rolling_avg'] = data['value'].rolling(window=7).mean()
+
+# Register the processed data
+context.register(data, "processed_data")
+print(f"Processed time series data in {process_id}")
+print(data.head(10))
+        """, process2_id)
+        
+        # Step 3: Analyze results in process1
+        workflow.execute("""
+# Get the processed data
+data = context.get("processed_data")
+
+# Analyze the results
+correlation = data['value'].corr(data['rolling_avg'])
+stats = {
+    'correlation': correlation,
+    'min': data['value'].min(),
+    'max': data['value'].max(),
+    'std_dev': data['value'].std()
+}
+
+print(f"Analysis complete in {process_id}:")
+print(stats)
+
+# Final result
+context.register(stats, "final_stats")
+        """, process1_id)
+        
+        # Get the final results
+        final_stats = workflow.get("final_stats")
+        print("\nFinal workflow results:")
+        for key, value in final_stats.items():
+            print(f"  {key}: {value}")
+        
+    finally:
+        # Shutdown BookKeeper
+        print("\nShutting down BookKeeper")
+        bk.shutdown()
+
+
+if __name__ == "__main__":
+    demo_bookkeeper_object_transfer()
