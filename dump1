@@ -1,1381 +1,1315 @@
-cmake_minimum_required(VERSION 3.14)
-project(ArrowFlightModule)
-
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Cross-platform configuration
-if(WIN32)
-    # Windows-specific settings
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-    add_definitions(-DNOMINMAX)  # Avoid min/max macro conflicts
-elseif(APPLE)
-    # macOS-specific settings
-    set(CMAKE_MACOSX_RPATH ON)
-    set(CMAKE_INSTALL_RPATH "@loader_path")
-else()
-    # Linux-specific settings
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN")
-endif()
-
-# Find required packages
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
-find_package(pybind11 CONFIG REQUIRED)
-find_package(GTest CONFIG REQUIRED)
-find_package(Arrow CONFIG REQUIRED)
-find_package(ArrowFlight CONFIG REQUIRED)
-
-# Set include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${ARROW_INCLUDE_DIR}
-)
-
-# Define source files
-set(SOURCES
-    src/flight_module.cpp
-    src/flight_service.cpp
-)
-
-# Create Python module
-pybind11_add_module(flight_module ${SOURCES})
-
-# Link libraries
-target_link_libraries(flight_module PRIVATE
-    Arrow::arrow_shared
-    Arrow::arrow_flight_shared
-)
-
-# Tests
-enable_testing()
-add_executable(flight_tests tests/test_main.cpp tests/test_flight.cpp)
-target_link_libraries(flight_tests PRIVATE
-    GTest::gtest
-    GTest::gtest_main
-    Arrow::arrow_shared
-    Arrow::arrow_flight_shared
-)
-
-# Add tests
-add_test(NAME flight_unit_tests COMMAND flight_tests)
-
-# Installation
-install(TARGETS flight_module
-        LIBRARY DESTINATION ${PYTHON_SITE_PACKAGES}
-        RUNTIME DESTINATION ${PYTHON_SITE_PACKAGES})
-
-
-#pragma once
-
+#include <arrow/api.h>
 #include <arrow/flight/api.h>
-#include <string>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
+#include <arrow/result.h>
+#include <arrow/status.h>
+#include <arrow/table.h>
 
-class FlightService {
-public:
-    FlightService();
-    std::string getFlightInfo();
-    arrow::Result<std::shared_ptr<arrow::Table>> getFlightData();
-};
-
-
-#include "flight_service.h"
-
-FlightService::FlightService() {}
-
-std::string FlightService::getFlightInfo() {
-    return "Flight service information";
-}
-
-arrow::Result<std::shared_ptr<arrow::Table>> FlightService::getFlightData() {
-    // Create a simple Arrow table
-    auto schema = arrow::schema({arrow::field("id", arrow::int32()),
-                                arrow::field("name", arrow::utf8())});
-    
-    auto id_array = arrow::Int32Array::FromJSON("[1, 2, 3, 4, 5]");
-    auto name_array = arrow::StringArray::FromJSON("[\"a\", \"b\", \"c\", \"d\", \"e\"]");
-    
-    return arrow::Table::Make(schema, {id_array.ValueOrDie(), name_array.ValueOrDie()});
-}
-
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include "flight_service.h"
-
-namespace py = pybind11;
-
-PYBIND11_MODULE(flight_module, m) {
-    m.doc() = "Arrow Flight Python bindings";
-    
-    py::class_<FlightService>(m, "FlightService")
-        .def(py::init<>())
-        .def("get_flight_info", &FlightService::getFlightInfo)
-        .def("get_flight_data", [](FlightService& service) {
-            auto result = service.getFlightData();
-            if (!result.ok()) {
-                throw std::runtime_error(result.status().ToString());
-            }
-            // Here you would convert Arrow Table to Python object
-            return py::cast(result.ValueOrDie());
-        });
-}
-#!/bin/bash
-mkdir -p build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-         -DCMAKE_INSTALL_PREFIX=$(python -c "import site; print(site.getsitepackages()[0])")
-make -j$(nproc)
-make install
-
-mkdir build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release ^
-         -DCMAKE_INSTALL_PREFIX=$(python -c "import site; print(site.getsitepackages()[0])")
-cmake --build . --config Release
-cmake --install . --config Release
-
-import flight_module
-
-# Create an instance of the FlightService
-service = flight_module.FlightService()
-
-# Get flight info
-info = service.get_flight_info()
-print(f"Flight Info: {info}")
-
-# Get flight data
-data = service.get_flight_data()
-print(f"Flight Data: {data}")
-
-# Create a new conda environment with debug symbols
-conda create -n arrow_env_debug python=3.10
-conda activate arrow_env_debug
-
-# Install packages with debug symbols
-conda install -c conda-forge pyarrow arrow-cpp=14.0.1 
-conda install -c conda-forge pyarrow-flight=14.0.1
-conda install -c conda-forge gtest cmake pybind11
-
-# Install memory profiling tools
-conda install -c conda-forge memory_profiler py-spy
-conda install -c conda-forge pytest pytest-memray
-pip install pympler
-
-cmake_minimum_required(VERSION 3.14)
-project(ArrowFlightModule)
-
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Debug configuration
-option(ENABLE_MEMORY_DEBUG "Enable memory debugging" OFF)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR ENABLE_MEMORY_DEBUG)
-    add_definitions(-DMEMORY_DEBUG)
-    # Add debug symbols even in release mode if memory debugging is enabled
-    add_compile_options(-g)
-endif()
-
-# Cross-platform configuration
-if(WIN32)
-    # Windows-specific settings
-    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
-    add_definitions(-DNOMINMAX)
-    if(ENABLE_MEMORY_DEBUG)
-        # Windows debug heap options
-        add_definitions(-D_CRTDBG_MAP_ALLOC)
-    endif()
-elseif(APPLE)
-    # macOS-specific settings
-    set(CMAKE_MACOSX_RPATH ON)
-    set(CMAKE_INSTALL_RPATH "@loader_path")
-    if(ENABLE_MEMORY_DEBUG)
-        # Add macOS-specific debug flags
-        add_compile_options(-fsanitize=address)
-        add_link_options(-fsanitize=address)
-    endif()
-else()
-    # Linux-specific settings
-    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN")
-    if(ENABLE_MEMORY_DEBUG)
-        # Add Linux-specific debug flags
-        add_compile_options(-fsanitize=address)
-        add_link_options(-fsanitize=address)
-    endif()
-endif()
-
-# Find required packages
-find_package(Python REQUIRED COMPONENTS Interpreter Development)
-find_package(pybind11 CONFIG REQUIRED)
-find_package(GTest CONFIG REQUIRED)
-find_package(Arrow CONFIG REQUIRED)
-find_package(ArrowFlight CONFIG REQUIRED)
-
-# Set include directories
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${ARROW_INCLUDE_DIR}
-)
-
-# Define source files
-set(SOURCES
-    src/flight_module.cpp
-    src/flight_service.cpp
-    src/memory_tracker.cpp
-)
-
-# Create Python module
-pybind11_add_module(flight_module ${SOURCES})
-
-# Link libraries
-target_link_libraries(flight_module PRIVATE
-    Arrow::arrow_shared
-    Arrow::arrow_flight_shared
-)
-
-# Tests
-enable_testing()
-add_executable(flight_tests tests/test_main.cpp tests/test_flight.cpp)
-target_link_libraries(flight_tests PRIVATE
-    GTest::gtest
-    GTest::gtest_main
-    Arrow::arrow_shared
-    Arrow::arrow_flight_shared
-)
-
-# Add tests
-add_test(NAME flight_unit_tests COMMAND flight_tests)
-
-# Installation
-install(TARGETS flight_module
-        LIBRARY DESTINATION ${PYTHON_SITE_PACKAGES}
-        RUNTIME DESTINATION ${PYTHON_SITE_PACKAGES})
-
-#pragma once
-
-#include <cstddef>
+#include <iostream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <mutex>
-#include <vector>
+#include <thread>
 #include <chrono>
+#include <sstream>
 
-class MemoryTracker {
-public:
-    static MemoryTracker& getInstance();
-    
-    void recordAllocation(void* ptr, size_t size, const std::string& description);
-    void recordDeallocation(void* ptr);
-    
-    // Stats and reporting
-    size_t getCurrentUsage() const;
-    size_t getPeakUsage() const;
-    void printReport() const;
-    
-    // Snapshot functions
-    struct MemorySnapshot {
-        std::chrono::system_clock::time_point timestamp;
-        size_t totalBytes;
-        std::unordered_map<std::string, size_t> categoryBytes;
-    };
-    
-    int takeSnapshot(const std::string& label = "");
-    MemorySnapshot getSnapshot(int id) const;
-    std::vector<MemorySnapshot> getAllSnapshots() const;
-    void clearSnapshots();
+namespace flight = arrow::flight;
+namespace fs = arrow::fs;
 
+// Data storage structure for the relay server
+struct StoredTable {
+    std::shared_ptr<arrow::Table> table;
+    std::string description;
+    std::chrono::system_clock::time_point timestamp;
+    std::string sender_id;
+    size_t access_count;
+    
+    StoredTable(std::shared_ptr<arrow::Table> t, const std::string& desc, 
+                const std::string& sender)
+        : table(std::move(t)), description(desc), 
+          timestamp(std::chrono::system_clock::now()),
+          sender_id(sender), access_count(0) {}
+};
+
+class ArrowFlightRelayServer : public flight::FlightServerBase {
 private:
-    MemoryTracker();
-    ~MemoryTracker();
-    
-    struct AllocationInfo {
-        size_t size;
-        std::string description;
-        std::chrono::system_clock::time_point timestamp;
-    };
-    
-    std::unordered_map<void*, AllocationInfo> allocations_;
-    std::vector<MemorySnapshot> snapshots_;
-    size_t currentBytes_;
-    size_t peakBytes_;
-    mutable std::mutex mutex_;
-};
+    std::unordered_map<std::string, std::unique_ptr<StoredTable>> data_store_;
+    mutable std::mutex data_mutex_;
+    size_t max_stored_tables_;
+    bool enable_logging_;
 
-// Helper macros for memory tracking
-#ifdef MEMORY_DEBUG
-    #define TRACK_ALLOC(ptr, size, desc) MemoryTracker::getInstance().recordAllocation(ptr, size, desc)
-    #define TRACK_DEALLOC(ptr) MemoryTracker::getInstance().recordDeallocation(ptr)
-    #define MEMORY_SNAPSHOT(label) MemoryTracker::getInstance().takeSnapshot(label)
-    #define MEMORY_REPORT() MemoryTracker::getInstance().printReport()
-#else
-    #define TRACK_ALLOC(ptr, size, desc) 
-    #define TRACK_DEALLOC(ptr)
-    #define MEMORY_SNAPSHOT(label) 0
-    #define MEMORY_REPORT()
-#endif
-
-#include "memory_tracker.h"
-#include <iostream>
-#include <iomanip>
-#include <algorithm>
-#include <numeric>
-
-MemoryTracker& MemoryTracker::getInstance() {
-    static MemoryTracker instance;
-    return instance;
-}
-
-MemoryTracker::MemoryTracker() 
-    : currentBytes_(0), peakBytes_(0) {}
-
-MemoryTracker::~MemoryTracker() {}
-
-void MemoryTracker::recordAllocation(void* ptr, size_t size, const std::string& description) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    allocations_[ptr] = {
-        size,
-        description,
-        std::chrono::system_clock::now()
-    };
-    
-    currentBytes_ += size;
-    peakBytes_ = std::max(peakBytes_, currentBytes_);
-}
-
-void MemoryTracker::recordDeallocation(void* ptr) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = allocations_.find(ptr);
-    if (it != allocations_.end()) {
-        currentBytes_ -= it->second.size;
-        allocations_.erase(it);
-    }
-}
-
-size_t MemoryTracker::getCurrentUsage() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return currentBytes_;
-}
-
-size_t MemoryTracker::getPeakUsage() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return peakBytes_;
-}
-
-int MemoryTracker::takeSnapshot(const std::string& label) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    MemorySnapshot snapshot;
-    snapshot.timestamp = std::chrono::system_clock::now();
-    snapshot.totalBytes = currentBytes_;
-    
-    // Group allocations by description
-    for (const auto& pair : allocations_) {
-        snapshot.categoryBytes[pair.second.description] += pair.second.size;
-    }
-    
-    snapshots_.push_back(snapshot);
-    return static_cast<int>(snapshots_.size() - 1);
-}
-
-MemoryTracker::MemorySnapshot MemoryTracker::getSnapshot(int id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (id >= 0 && id < static_cast<int>(snapshots_.size())) {
-        return snapshots_[id];
-    }
-    return MemorySnapshot{};
-}
-
-std::vector<MemoryTracker::MemorySnapshot> MemoryTracker::getAllSnapshots() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return snapshots_;
-}
-
-void MemoryTracker::clearSnapshots() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshots_.clear();
-}
-
-void MemoryTracker::printReport() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    std::cout << "===== Memory Usage Report =====" << std::endl;
-    std::cout << "Current memory usage: " << (currentBytes_ / 1024.0) << " KB" << std::endl;
-    std::cout << "Peak memory usage: " << (peakBytes_ / 1024.0) << " KB" << std::endl;
-    std::cout << "Number of active allocations: " << allocations_.size() << std::endl;
-    
-    // Group by description
-    std::unordered_map<std::string, size_t> byDescription;
-    for (const auto& pair : allocations_) {
-        byDescription[pair.second.description] += pair.second.size;
-    }
-    
-    std::cout << "\nMemory Usage by Category:" << std::endl;
-    std::cout << std::left << std::setw(50) << "Description" 
-              << std::right << std::setw(15) << "Size (KB)" 
-              << std::right << std::setw(15) << "Percentage" << std::endl;
-    std::cout << std::string(80, '-') << std::endl;
-    
-    for (const auto& pair : byDescription) {
-        double percentage = (currentBytes_ > 0) ? (100.0 * pair.second / currentBytes_) : 0.0;
-        std::cout << std::left << std::setw(50) << pair.first 
-                  << std::right << std::setw(15) << (pair.second / 1024.0) 
-                  << std::right << std::setw(15) << std::fixed << std::setprecision(2) << percentage << "%" << std::endl;
-    }
-    
-    std::cout << std::string(80, '-') << std::endl;
-}
-
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/numpy.h>
-#include "flight_service.h"
-#include "memory_tracker.h"
-
-namespace py = pybind11;
-
-// Custom allocator that tracks memory
-class TrackedAllocator {
 public:
-    // Allocate memory and track it
-    static void* allocate(size_t size) {
-        void* ptr = std::malloc(size);
-        TRACK_ALLOC(ptr, size, "PyBind11 Allocation");
-        return ptr;
+    explicit ArrowFlightRelayServer(size_t max_tables = 1000, bool logging = true)
+        : max_stored_tables_(max_tables), enable_logging_(logging) {
+        if (enable_logging_) {
+            std::cout << "[Server] ArrowFlight Relay Server initialized" << std::endl;
+            std::cout << "[Server] Maximum stored tables: " << max_stored_tables_ << std::endl;
+        }
     }
-    
-    // Deallocate memory and update tracking
-    static void deallocate(void* ptr) {
-        TRACK_DEALLOC(ptr);
-        std::free(ptr);
+
+    // List all available flights (stored tables)
+    arrow::Status ListFlights(const flight::ServerCallContext& context,
+                             const flight::Criteria* criteria,
+                             std::unique_ptr<flight::FlightListing>* listings) override {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        
+        std::vector<flight::FlightInfo> flights;
+        
+        for (const auto& [key, stored_table] : data_store_) {
+            // Create flight descriptor
+            auto descriptor = flight::FlightDescriptor::Path({key});
+            
+            // Create flight endpoint
+            flight::Location location;
+            ARROW_ASSIGN_OR_RAISE(location, flight::Location::ForGrpcTcp("localhost", 0));
+            std::vector<flight::FlightEndpoint> endpoints{flight::FlightEndpoint{{"localhost:8080"}, {location}}};
+            
+            // Get table schema
+            auto schema = stored_table->table->schema();
+            
+            // Create flight info with metadata
+            auto info = flight::FlightInfo::Make(*schema, descriptor, endpoints, 
+                                               stored_table->table->num_rows(), 
+                                               -1);  // -1 for unknown size
+            
+            flights.push_back(*info);
+        }
+        
+        *listings = std::make_unique<flight::SimpleFlightListing>(flights);
+        
+        if (enable_logging_) {
+            std::cout << "[Server] Listed " << flights.size() << " available flights" << std::endl;
+        }
+        
+        return arrow::Status::OK();
+    }
+
+    // Get flight info for a specific table
+    arrow::Status GetFlightInfo(const flight::ServerCallContext& context,
+                               const flight::FlightDescriptor& descriptor,
+                               std::unique_ptr<flight::FlightInfo>* info) override {
+        if (descriptor.type != flight::FlightDescriptor::PATH || descriptor.path.empty()) {
+            return arrow::Status::Invalid("Invalid flight descriptor");
+        }
+        
+        std::string table_key = descriptor.path[0];
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        
+        auto it = data_store_.find(table_key);
+        if (it == data_store_.end()) {
+            return arrow::Status::KeyError("Table not found: " + table_key);
+        }
+        
+        // Create flight endpoint
+        flight::Location location;
+        ARROW_ASSIGN_OR_RAISE(location, flight::Location::ForGrpcTcp("localhost", 8080));
+        std::vector<flight::FlightEndpoint> endpoints{flight::FlightEndpoint{{table_key}, {location}}};
+        
+        auto flight_info = flight::FlightInfo::Make(
+            *it->second->table->schema(),
+            descriptor,
+            endpoints,
+            it->second->table->num_rows(),
+            -1
+        );
+        
+        *info = std::make_unique<flight::FlightInfo>(*flight_info);
+        
+        if (enable_logging_) {
+            std::cout << "[Server] Flight info requested for: " << table_key << std::endl;
+        }
+        
+        return arrow::Status::OK();
+    }
+
+    // Serve data to clients (DoGet)
+    arrow::Status DoGet(const flight::ServerCallContext& context,
+                       const flight::Ticket& ticket,
+                       std::unique_ptr<flight::FlightDataStream>* stream) override {
+        std::string table_key = ticket.ticket;
+        
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        auto it = data_store_.find(table_key);
+        if (it == data_store_.end()) {
+            return arrow::Status::KeyError("Table not found: " + table_key);
+        }
+        
+        // Increment access count
+        it->second->access_count++;
+        
+        // Create a record batch reader from the table
+        auto reader = std::make_shared<arrow::TableBatchReader>(*it->second->table);
+        
+        // Create flight data stream
+        *stream = std::make_unique<flight::RecordBatchStream>(reader);
+        
+        if (enable_logging_) {
+            std::cout << "[Server] Serving table: " << table_key 
+                     << " (access count: " << it->second->access_count << ")" << std::endl;
+        }
+        
+        return arrow::Status::OK();
+    }
+
+    // Receive data from clients (DoPut)
+    arrow::Status DoPut(const flight::ServerCallContext& context,
+                       std::unique_ptr<flight::FlightMessageReader> reader,
+                       std::unique_ptr<flight::FlightMetadataWriter> writer) override {
+        
+        // Get the flight descriptor from the first message
+        flight::FlightDescriptor descriptor;
+        ARROW_RETURN_NOT_OK(reader->GetDescriptor(&descriptor));
+        
+        if (descriptor.type != flight::FlightDescriptor::PATH || descriptor.path.empty()) {
+            return arrow::Status::Invalid("Invalid flight descriptor for put operation");
+        }
+        
+        std::string table_key = descriptor.path[0];
+        
+        // Read all record batches
+        std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+        while (true) {
+            flight::FlightStreamChunk chunk;
+            ARROW_RETURN_NOT_OK(reader->Next(&chunk));
+            if (chunk.data == nullptr) break;
+            batches.push_back(chunk.data);
+        }
+        
+        if (batches.empty()) {
+            return arrow::Status::Invalid("No data received");
+        }
+        
+        // Convert batches to table
+        ARROW_ASSIGN_OR_RAISE(auto table, arrow::Table::FromRecordBatches(batches));
+        
+        // Extract metadata if available
+        std::string description = "Data table";
+        std::string sender_id = "unknown";
+        
+        // Try to get metadata from context
+        auto metadata = context.incoming_headers();
+        for (const auto& [key, value] : metadata) {
+            if (key == "description") {
+                description = value;
+            } else if (key == "sender_id") {
+                sender_id = value;
+            }
+        }
+        
+        // Store the table
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            
+            // Check if we're at capacity and need to remove old entries
+            if (data_store_.size() >= max_stored_tables_) {
+                // Find oldest entry to remove
+                auto oldest = data_store_.begin();
+                for (auto it = data_store_.begin(); it != data_store_.end(); ++it) {
+                    if (it->second->timestamp < oldest->second->timestamp) {
+                        oldest = it;
+                    }
+                }
+                if (enable_logging_) {
+                    std::cout << "[Server] Removing oldest table: " << oldest->first << std::endl;
+                }
+                data_store_.erase(oldest);
+            }
+            
+            data_store_[table_key] = std::make_unique<StoredTable>(table, description, sender_id);
+        }
+        
+        if (enable_logging_) {
+            std::cout << "[Server] Stored table: " << table_key 
+                     << " (" << table->num_rows() << " rows, " 
+                     << table->num_columns() << " columns)" 
+                     << " from sender: " << sender_id << std::endl;
+        }
+        
+        return arrow::Status::OK();
+    }
+
+    // Get server statistics
+    arrow::Status DoAction(const flight::ServerCallContext& context,
+                          const flight::Action& action,
+                          std::unique_ptr<flight::ResultStream>* result) override {
+        
+        if (action.type == "get_stats") {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            
+            std::stringstream stats;
+            stats << "{\n";
+            stats << "  \"stored_tables\": " << data_store_.size() << ",\n";
+            stats << "  \"max_capacity\": " << max_stored_tables_ << ",\n";
+            stats << "  \"tables\": [\n";
+            
+            bool first = true;
+            for (const auto& [key, stored_table] : data_store_) {
+                if (!first) stats << ",\n";
+                first = false;
+                
+                auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now() - stored_table->timestamp
+                ).count();
+                
+                stats << "    {\n";
+                stats << "      \"key\": \"" << key << "\",\n";
+                stats << "      \"rows\": " << stored_table->table->num_rows() << ",\n";
+                stats << "      \"columns\": " << stored_table->table->num_columns() << ",\n";
+                stats << "      \"age_seconds\": " << duration << ",\n";
+                stats << "      \"access_count\": " << stored_table->access_count << ",\n";
+                stats << "      \"sender_id\": \"" << stored_table->sender_id << "\",\n";
+                stats << "      \"description\": \"" << stored_table->description << "\"\n";
+                stats << "    }";
+            }
+            
+            stats << "\n  ]\n}";
+            
+            auto buffer = arrow::Buffer::FromString(stats.str());
+            std::vector<std::shared_ptr<arrow::Buffer>> results = {buffer};
+            *result = std::make_unique<flight::SimpleResultStream>(std::move(results));
+            
+            if (enable_logging_) {
+                std::cout << "[Server] Statistics requested" << std::endl;
+            }
+            
+            return arrow::Status::OK();
+        }
+        
+        if (action.type == "clear_all") {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            size_t count = data_store_.size();
+            data_store_.clear();
+            
+            std::string response = "Cleared " + std::to_string(count) + " tables";
+            auto buffer = arrow::Buffer::FromString(response);
+            std::vector<std::shared_ptr<arrow::Buffer>> results = {buffer};
+            *result = std::make_unique<flight::SimpleResultStream>(std::move(results));
+            
+            if (enable_logging_) {
+                std::cout << "[Server] Cleared all stored tables (" << count << ")" << std::endl;
+            }
+            
+            return arrow::Status::OK();
+        }
+        
+        return arrow::Status::NotImplemented("Unknown action: " + action.type);
+    }
+
+    // List available actions
+    arrow::Status ListActions(const flight::ServerCallContext& context,
+                             std::vector<flight::ActionType>* actions) override {
+        *actions = {
+            {"get_stats", "Get server statistics and stored table information"},
+            {"clear_all", "Clear all stored tables"}
+        };
+        return arrow::Status::OK();
     }
 };
 
-PYBIND11_MODULE(flight_module, m) {
-    m.doc() = "Arrow Flight Python bindings with memory tracking";
+// Main server function
+int main(int argc, char** argv) {
+    // Parse command line arguments
+    int port = 8080;
+    size_t max_tables = 1000;
+    bool enable_logging = true;
     
-    py::class_<FlightService>(m, "FlightService")
-        .def(py::init<>())
-        .def("get_flight_info", &FlightService::getFlightInfo)
-        .def("get_flight_data", [](FlightService& service) {
-            int snapshotId = MEMORY_SNAPSHOT("Before get_flight_data");
-            
-            auto result = service.getFlightData();
-            if (!result.ok()) {
-                throw std::runtime_error(result.status().ToString());
-            }
-            
-            MEMORY_SNAPSHOT("After get_flight_data");
-            
-            // Here you would convert Arrow Table to Python object
-            return py::cast(result.ValueOrDie());
-        });
-    
-    // Expose memory tracking functions to Python
-    py::class_<MemoryTracker>(m, "MemoryTracker")
-        .def_static("get_instance", &MemoryTracker::getInstance, py::return_value_policy::reference)
-        .def("get_current_usage", &MemoryTracker::getCurrentUsage)
-        .def("get_peak_usage", &MemoryTracker::getPeakUsage)
-        .def("print_report", &MemoryTracker::printReport)
-        .def("take_snapshot", &MemoryTracker::takeSnapshot)
-        .def("clear_snapshots", &MemoryTracker::clearSnapshots)
-        .def("get_all_snapshots", [](MemoryTracker& tracker) {
-            auto snapshots = tracker.getAllSnapshots();
-            py::list result;
-            
-            for (const auto& snapshot : snapshots) {
-                py::dict sDict;
-                // Convert timestamp to Python datetime
-                auto time_t = std::chrono::system_clock::to_time_t(snapshot.timestamp);
-                sDict["timestamp"] = py::cast(time_t);
-                sDict["total_bytes"] = py::cast(snapshot.totalBytes);
-                
-                py::dict categories;
-                for (const auto& cat : snapshot.categoryBytes) {
-                    categories[py::cast(cat.first).ptr()] = py::cast(cat.second);
-                }
-                sDict["categories"] = categories;
-                
-                result.append(sDict);
-            }
-            
-            return result;
-        });
-    
-    // Add functions for explicit memory testing
-    m.def("create_test_objects", [](size_t numObjects, size_t sizePerObject) {
-        std::vector<std::vector<uint8_t>> objects;
-        for (size_t i = 0; i < numObjects; i++) {
-            auto vec = std::vector<uint8_t>(sizePerObject, 0);
-            TRACK_ALLOC(vec.data(), sizePerObject, "Test Object");
-            objects.push_back(std::move(vec));
-        }
-        return objects;
-    });
-    
-    m.def("force_gc", []() {
-        py::gil_scoped_acquire acquire;
-        py::module::import("gc").attr("collect")();
-    });
-}
-
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <pybind11/numpy.h>
-#include "flight_service.h"
-#include "memory_tracker.h"
-
-namespace py = pybind11;
-
-// Custom allocator that tracks memory
-class TrackedAllocator {
-public:
-    // Allocate memory and track it
-    static void* allocate(size_t size) {
-        void* ptr = std::malloc(size);
-        TRACK_ALLOC(ptr, size, "PyBind11 Allocation");
-        return ptr;
+    if (argc > 1) {
+        port = std::atoi(argv[1]);
+    }
+    if (argc > 2) {
+        max_tables = std::atoi(argv[2]);
+    }
+    if (argc > 3) {
+        enable_logging = (std::string(argv[3]) == "true");
     }
     
-    // Deallocate memory and update tracking
-    static void deallocate(void* ptr) {
-        TRACK_DEALLOC(ptr);
-        std::free(ptr);
+    // Create and configure server
+    auto server = std::make_unique<ArrowFlightRelayServer>(max_tables, enable_logging);
+    
+    flight::Location location;
+    auto location_result = flight::Location::ForGrpcTcp("0.0.0.0", port);
+    if (!location_result.ok()) {
+        std::cerr << "Failed to create location: " << location_result.status().ToString() << std::endl;
+        return 1;
     }
-};
-
-PYBIND11_MODULE(flight_module, m) {
-    m.doc() = "Arrow Flight Python bindings with memory tracking";
+    location = location_result.ValueOrDie();
     
-    py::class_<FlightService>(m, "FlightService")
-        .def(py::init<>())
-        .def("get_flight_info", &FlightService::getFlightInfo)
-        .def("get_flight_data", [](FlightService& service) {
-            int snapshotId = MEMORY_SNAPSHOT("Before get_flight_data");
-            
-            auto result = service.getFlightData();
-            if (!result.ok()) {
-                throw std::runtime_error(result.status().ToString());
-            }
-            
-            MEMORY_SNAPSHOT("After get_flight_data");
-            
-            // Here you would convert Arrow Table to Python object
-            return py::cast(result.ValueOrDie());
-        });
+    flight::FlightServerOptions options(location);
     
-    // Expose memory tracking functions to Python
-    py::class_<MemoryTracker>(m, "MemoryTracker")
-        .def_static("get_instance", &MemoryTracker::getInstance, py::return_value_policy::reference)
-        .def("get_current_usage", &MemoryTracker::getCurrentUsage)
-        .def("get_peak_usage", &MemoryTracker::getPeakUsage)
-        .def("print_report", &MemoryTracker::printReport)
-        .def("take_snapshot", &MemoryTracker::takeSnapshot)
-        .def("clear_snapshots", &MemoryTracker::clearSnapshots)
-        .def("get_all_snapshots", [](MemoryTracker& tracker) {
-            auto snapshots = tracker.getAllSnapshots();
-            py::list result;
-            
-            for (const auto& snapshot : snapshots) {
-                py::dict sDict;
-                // Convert timestamp to Python datetime
-                auto time_t = std::chrono::system_clock::to_time_t(snapshot.timestamp);
-                sDict["timestamp"] = py::cast(time_t);
-                sDict["total_bytes"] = py::cast(snapshot.totalBytes);
-                
-                py::dict categories;
-                for (const auto& cat : snapshot.categoryBytes) {
-                    categories[py::cast(cat.first).ptr()] = py::cast(cat.second);
-                }
-                sDict["categories"] = categories;
-                
-                result.append(sDict);
-            }
-            
-            return result;
-        });
+    std::cout << "Starting ArrowFlight Relay Server on " << location.ToString() << std::endl;
+    std::cout << "Maximum stored tables: " << max_tables << std::endl;
+    std::cout << "Logging enabled: " << (enable_logging ? "true" : "false") << std::endl;
+    std::cout << "Usage: " << argv[0] << " [port] [max_tables] [enable_logging]" << std::endl;
+    std::cout << "Press Ctrl+C to stop the server" << std::endl;
     
-    // Add functions for explicit memory testing
-    m.def("create_test_objects", [](size_t numObjects, size_t sizePerObject) {
-        std::vector<std::vector<uint8_t>> objects;
-        for (size_t i = 0; i < numObjects; i++) {
-            auto vec = std::vector<uint8_t>(sizePerObject, 0);
-            TRACK_ALLOC(vec.data(), sizePerObject, "Test Object");
-            objects.push_back(std::move(vec));
-        }
-        return objects;
-    });
+    // Start server
+    auto init_result = server->Init(options);
+    if (!init_result.ok()) {
+        std::cerr << "Failed to start server: " << init_result.ToString() << std::endl;
+        return 1;
+    }
     
-    m.def("force_gc", []() {
-        py::gil_scoped_acquire acquire;
-        py::module::import("gc").attr("collect")();
-    });
+    auto serve_result = server->Serve();
+    if (!serve_result.ok()) {
+        std::cerr << "Server error: " << serve_result.ToString() << std::endl;
+        return 1;
+    }
+    
+    return 0;
 }
-
-import gc
-import time
-import tracemalloc
-import os
-import sys
-import matplotlib.pyplot as plt
-import numpy as np
-from pympler import muppy, summary
-from memory_profiler import profile
-import flight_module
-
-class MemoryProfiler:
-    def __init__(self):
-        self.snapshots = []
-        
-    def start_tracking(self):
-        """Start tracking memory usage with tracemalloc"""
-        tracemalloc.start()
-        
-    def take_snapshot(self, label=""):
-        """Take a snapshot of current memory usage"""
-        snapshot = tracemalloc.take_snapshot()
-        self.snapshots.append((label, snapshot))
-        return len(self.snapshots) - 1
-        
-    def compare_snapshots(self, snapshot1_idx, snapshot2_idx):
-        """Compare two snapshots and show memory differences"""
-        if not (0 <= snapshot1_idx < len(self.snapshots) and 
-                0 <= snapshot2_idx < len(self.snapshots)):
-            print("Invalid snapshot indices")
-            return
-            
-        snapshot1 = self.snapshots[snapshot1_idx][1]
-        snapshot2 = self.snapshots[snapshot2_idx][1]
-        
-        top_stats = snapshot2.compare_to(snapshot1, 'lineno')
-        
-        print(f"\nMemory difference between {self.snapshots[snapshot1_idx][0]} "
-              f"and {self.snapshots[snapshot2_idx][0]}:")
-        for stat in top_stats[:10]:
-            print(f"{stat.size_diff / 1024:.1f} KB: {stat.traceback.format()[0]}")
-    
-    def print_extension_stats(self):
-        """Print memory stats from the C++ extension"""
-        flight_module.MemoryTracker.get_instance().print_report()
-    
-    def plot_memory_timeline(self):
-        """Plot memory usage over time from C++ extension snapshots"""
-        snapshots = flight_module.MemoryTracker.get_instance().get_all_snapshots()
-        
-        if not snapshots:
-            print("No memory snapshots available")
-            return
-            
-        times = [snap["timestamp"] for snap in snapshots]
-        memory = [snap["total_bytes"] / 1024.0 for snap in snapshots]  # KB
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(times, memory, marker='o')
-        plt.xlabel('Time')
-        plt.ylabel('Memory Usage (KB)')
-        plt.title('Memory Usage Over Time')
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig('memory_timeline.png')
-        print(f"Memory timeline saved to {os.path.abspath('memory_timeline.png')}")
-        
-    def plot_memory_categories(self, snapshot_idx=-1):
-        """Plot memory usage by category for a specific snapshot"""
-        snapshots = flight_module.MemoryTracker.get_instance().get_all_snapshots()
-        
-        if not snapshots:
-            print("No memory snapshots available")
-            return
-            
-        if snapshot_idx < 0:
-            snapshot_idx = len(snapshots) + snapshot_idx
-            
-        if not (0 <= snapshot_idx < len(snapshots)):
-            print("Invalid snapshot index")
-            return
-            
-        snapshot = snapshots[snapshot_idx]
-        categories = snapshot["categories"]
-        
-        labels = list(categories.keys())
-        sizes = [size / 1024.0 for size in categories.values()]  # KB
-        
-        plt.figure(figsize=(10, 6))
-        plt.pie(sizes, labels=labels, autopct='%1.1f%%')
-        plt.axis('equal')
-        plt.title('Memory Usage by Category')
-        plt.tight_layout()
-        plt.savefig('memory_categories.png')
-        print(f"Memory categories chart saved to {os.path.abspath('memory_categories.png')}")
-
-# Function to run a memory-profiled test
-@profile
-def test_flight_module_memory():
-    profiler = MemoryProfiler()
-    profiler.start_tracking()
-    
-    # Take a baseline snapshot
-    baseline_idx = profiler.take_snapshot("Baseline")
-    
-    # Create flight service and record memory snapshot
-    service = flight_module.FlightService()
-    after_init_idx = profiler.take_snapshot("After Initialization")
-    
-    # Create some test objects to observe memory usage
-    test_objects = flight_module.create_test_objects(10000, 1000)  # 10MB of test data
-    after_test_objects_idx = profiler.take_snapshot("After Test Objects")
-    
-    # Get flight data
-    flight_data = service.get_flight_data()
-    after_flight_data_idx = profiler.take_snapshot("After Flight Data")
-    
-    # Force garbage collection
-    flight_module.force_gc()
-    gc.collect()
-    after_gc_idx = profiler.take_snapshot("After GC")
-    
-    # Print memory comparisons
-    profiler.compare_snapshots(baseline_idx, after_init_idx)
-    profiler.compare_snapshots(after_init_idx, after_test_objects_idx)
-    profiler.compare_snapshots(after_test_objects_idx, after_flight_data_idx)
-    profiler.compare_snapshots(after_flight_data_idx, after_gc_idx)
-    
-    # Print stats from the C++ extension
-    profiler.print_extension_stats()
-    
-    # Plot memory usage
-    profiler.plot_memory_timeline()
-    profiler.plot_memory_categories()
-    
-    return "Memory profiling completed"
-
-if __name__ == "__main__":
-    test_flight_module_memory()
-
-
-#!/bin/bash
-# Enable debug mode by default
-DEBUG_MODE=1
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    key="$1"
-    case $key in
-        --no-debug)
-        DEBUG_MODE=0
-        shift
-        ;;
-        *)
-        shift
-        ;;
-    esac
-done
-
-mkdir -p build
-cd build
-
-# Set build type based on debug mode
-if [ $DEBUG_MODE -eq 1 ]; then
-    echo "Building with memory debugging enabled..."
-    BUILD_TYPE="Debug"
-    MEMORY_DEBUG="-DENABLE_MEMORY_DEBUG=ON"
-else
-    echo "Building in release mode..."
-    BUILD_TYPE="Release"
-    MEMORY_DEBUG=""
-fi
-
-# Get Python site-packages directory
-SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-
-# Configure and build
-cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
-         $MEMORY_DEBUG \
-         -DCMAKE_INSTALL_PREFIX=$SITE_PACKAGES
-
-# Use nproc on Linux, sysctl on macOS to determine number of cores
-if [[ "$(uname)" == "Darwin" ]]; then
-    CORES=$(sysctl -n hw.ncpu)
-else
-    CORES=$(nproc)
-fi
-
-# Build and install
-make -j$CORES
-make install
-
-echo "Build complete. Module installed to $SITE_PACKAGES"
-
-@echo off
-REM Enable debug mode by default
-set DEBUG_MODE=1
-
-REM Parse command line arguments
-:parse_args
-if "%~1"=="" goto end_parse_args
-if "%~1"=="--no-debug" set DEBUG_MODE=0
-shift
-goto parse_args
-:end_parse_args
-
-mkdir build 2>nul
-cd build
-
-REM Set build type based on debug mode
-if %DEBUG_MODE%==1 (
-    echo Building with memory debugging enabled...
-    set BUILD_TYPE=Debug
-    set MEMORY_DEBUG=-DENABLE_MEMORY_DEBUG=ON
-) else (
-    echo Building in release mode...
-    set BUILD_TYPE=Release
-    set MEMORY_DEBUG=
-)
-
-REM Get Python site-packages directory
-for /f "tokens=*" %%i in ('python -c "import site; print(site.getsitepackages()[0])"') do set SITE_PACKAGES=%%i
-
-REM Configure and build
-cmake .. -DCMAKE_BUILD_TYPE=%BUILD_TYPE% ^
-         %MEMORY_DEBUG% ^
-         -DCMAKE_INSTALL_PREFIX=%SITE_PACKAGES%
-
-REM Build and install
-cmake --build . --config %BUILD_TYPE% -j %NUMBER_OF_PROCESSORS%
-cmake --install . --config %BUILD_TYPE%
-
-echo Build complete. Module installed to %SITE_PACKAGES%
-cd ..
-
-import flight_module
-import memory_debug
-import matplotlib.pyplot as plt
-
-# Initialize memory tracking
-tracker = flight_module.MemoryTracker.get_instance()
-
-# Take baseline snapshot
-baseline_id = tracker.take_snapshot("Baseline")
-
-# Create flight service
-service = flight_module.FlightService()
-init_id = tracker.take_snapshot("After initialization")
-
-# Generate some test data
-test_objects = flight_module.create_test_objects(5000, 2000)  # 10MB
-after_alloc_id = tracker.take_snapshot("After allocation")
-
-# Get flight data
-data = service.get_flight_data()
-after_data_id = tracker.take_snapshot("After data retrieval")
-
-# Force garbage collection
-flight_module.force_gc()
-after_gc_id = tracker.take_snapshot("After garbage collection")
-
-# Print memory report
-tracker.print_report()
-
-# Use the memory_debug utility to visualize memory usage
-profiler = memory_debug.MemoryProfiler()
-profiler.plot_memory_timeline()
-profiler.plot_memory_categories()
-
 
 #!/usr/bin/env python3
 """
-BookKeeper Sample: Inter-Process Object Transfer Demo
-
-This sample demonstrates how BookKeeper works as a central service that:
-1. Manages multiple processes
-2. Allows processes to register objects
-3. Enables object transfer between processes
-4. Executes code in different processes with specific contexts
+ArrowFlight Python Client for communicating with the C++ relay server.
+Supports sending and receiving pandas DataFrames and Arrow tables.
 """
 
-import os
-import time
-import numpy as np
+import pyarrow as pa
+import pyarrow.flight as flight
 import pandas as pd
-import multiprocessing as mp
-from typing import Dict, List, Any, Optional, Union
+import json
+import uuid
+import time
+from typing import Dict, List, Optional, Union, Any, Tuple
+from contextlib import contextmanager
+import logging
 
-# Mock implementation of the BookKeeper Python client
-# In a real implementation, this would connect to the C++ BookKeeper service
-class BookKeeper:
-    def __init__(self, host: str = "localhost", port: int = 50051):
-        """Initialize the BookKeeper client.
+
+class ArrowFlightClient:
+    """
+    Python client for the ArrowFlight relay server.
+    Handles conversion between pandas DataFrames and Arrow tables.
+    """
+    
+    def __init__(self, host: str = "localhost", port: int = 8080, 
+                 sender_id: Optional[str] = None, timeout: float = 30.0):
+        """
+        Initialize the ArrowFlight client.
         
         Args:
-            host: The hostname of the BookKeeper server
-            port: The port of the BookKeeper server
+            host: Server hostname
+            port: Server port
+            sender_id: Unique identifier for this client
+            timeout: Connection timeout in seconds
         """
-        print(f"Connecting to BookKeeper server at {host}:{port}")
         self.host = host
         self.port = port
-        self.processes: Dict[str, "Process"] = {}
-        self.objects: Dict[str, Any] = {}
-        self.contexts: Dict[str, "Context"] = {}
+        self.sender_id = sender_id or f"client_{uuid.uuid4().hex[:8]}"
+        self.timeout = timeout
         
-        # In a real implementation, this would establish a gRPC connection
-        # to the BookKeeper server
-        self._server_connection = None
+        # Create flight client
+        location = flight.Location.for_grpc_tcp(host, port)
+        self.client = flight.FlightClient(location)
         
-    def initialize(self) -> None:
-        """Initialize the BookKeeper client."""
-        print("Initializing BookKeeper client")
-        # In a real implementation, this would initialize the connection
-        # and authenticate with the server
+        # Setup logging
+        self.logger = logging.getLogger(f"ArrowFlightClient-{self.sender_id}")
         
-    def create_process(self, name: str, env_vars: Optional[Dict[str, str]] = None) -> str:
-        """Create a new process managed by BookKeeper.
+        # Test connection
+        self._test_connection()
+    
+    def _test_connection(self) -> None:
+        """Test connection to the server."""
+        try:
+            list(self.client.list_flights())
+            self.logger.info(f"Connected to ArrowFlight server at {self.host}:{self.port}")
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to server: {e}")
+    
+    @contextmanager
+    def _handle_flight_errors(self, operation: str):
+        """Context manager for handling Flight errors with meaningful messages."""
+        try:
+            yield
+        except flight.FlightError as e:
+            self.logger.error(f"{operation} failed: {e}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Unexpected error during {operation}: {e}")
+            raise
+    
+    def send_dataframe(self, key: str, df: pd.DataFrame, 
+                      description: str = "DataFrame from Python") -> bool:
+        """
+        Send a pandas DataFrame to the server.
         
         Args:
-            name: The name of the process
-            env_vars: Environment variables to set for the process
+            key: Unique identifier for the data
+            df: pandas DataFrame to send
+            description: Description of the data
             
         Returns:
-            The process ID
+            True if successful, False otherwise
         """
-        print(f"Creating process: {name}")
-        process_id = f"process_{len(self.processes) + 1}"
-        self.processes[process_id] = Process(self, process_id, name, env_vars or {})
-        return process_id
-    
-    def get_process(self, process_id: str) -> "Process":
-        """Get a process by ID.
-        
-        Args:
-            process_id: The ID of the process
-            
-        Returns:
-            The Process object
-        """
-        if process_id not in self.processes:
-            raise ValueError(f"Process {process_id} not found")
-        return self.processes[process_id]
-    
-    def list_processes(self) -> List[str]:
-        """List all processes managed by BookKeeper.
-        
-        Returns:
-            A list of process IDs
-        """
-        return list(self.processes.keys())
-    
-    def get_context(self, context_name: str) -> Optional["Context"]:
-        """Get or create an execution context.
-        
-        Args:
-            context_name: The name of the context
-            
-        Returns:
-            The Context object, or None if it doesn't exist
-        """
-        return self.contexts.get(context_name)
-    
-    def create_context(self, context_name: str) -> "Context":
-        """Create a new execution context.
-        
-        Args:
-            context_name: The name of the context
-            
-        Returns:
-            The new Context object
-        """
-        print(f"Creating context: {context_name}")
-        context = Context(self, context_name)
-        self.contexts[context_name] = context
-        return context
-    
-    def register_object(self, obj: Any, name: str, namespace: str = "default") -> str:
-        """Register an object with BookKeeper.
-        
-        Args:
-            obj: The object to register
-            name: The name of the object
-            namespace: The namespace for the object
-            
-        Returns:
-            The object ID
-        """
-        object_id = f"{namespace}:{name}"
-        print(f"Registering object: {object_id}")
-        self.objects[object_id] = obj
-        return object_id
-    
-    def get_object(self, object_id: str) -> Any:
-        """Get an object by ID.
-        
-        Args:
-            object_id: The ID of the object
-            
-        Returns:
-            The object
-        """
-        if object_id not in self.objects:
-            raise ValueError(f"Object {object_id} not found")
-        print(f"Retrieving object: {object_id}")
-        return self.objects[object_id]
-    
-    def execute(self, process_id: str, code: str, context_name: Optional[str] = None) -> Dict[str, Any]:
-        """Execute code in a specific process.
-        
-        Args:
-            process_id: The ID of the process to execute in
-            code: The Python code to execute
-            context_name: Optional context name to execute within
-            
-        Returns:
-            The execution result
-        """
-        process = self.get_process(process_id)
-        context = None
-        if context_name:
-            context = self.get_context(context_name)
-            if not context:
-                context = self.create_context(context_name)
-        
-        return process.execute(code, context)
-    
-    def shutdown(self) -> None:
-        """Shutdown the BookKeeper client."""
-        print("Shutting down BookKeeper client")
-        # In a real implementation, this would close the connection
-        # and clean up resources
-        for process_id in list(self.processes.keys()):
-            self.processes[process_id].terminate()
-        self.processes.clear()
-        self.objects.clear()
-        self.contexts.clear()
-
-
-class Process:
-    def __init__(self, bookkeeper: BookKeeper, process_id: str, name: str, env_vars: Dict[str, str]):
-        """Initialize a process managed by BookKeeper.
-        
-        Args:
-            bookkeeper: The BookKeeper instance
-            process_id: The ID of the process
-            name: The name of the process
-            env_vars: Environment variables for the process
-        """
-        self.bookkeeper = bookkeeper
-        self.process_id = process_id
-        self.name = name
-        self.env_vars = env_vars
-        self.running = True
-        
-        # In a real implementation, this would be a separate OS process
-        # managed by the BookKeeper server
-        
-    def execute(self, code: str, context: Optional["Context"] = None) -> Dict[str, Any]:
-        """Execute code in this process.
-        
-        Args:
-            code: The Python code to execute
-            context: Optional context to execute within
-            
-        Returns:
-            The execution result
-        """
-        if not self.running:
-            raise RuntimeError(f"Process {self.process_id} is not running")
-        
-        print(f"Executing in process {self.process_id}" + 
-              (f" with context {context.name}" if context else ""))
-        
-        # In a real implementation, this would send the code to the
-        # actual process for execution
-        
-        # For this demo, we'll use a simple exec with a custom globals dict
-        globals_dict = {
-            "np": np,
-            "pd": pd,
-            "bookkeeper": self.bookkeeper,
-            "process_id": self.process_id,
-            "context": context,
-            "os": os,
-            "time": time,
-        }
-        
-        # Add context-specific objects if a context is provided
-        if context:
-            for obj_id, obj in context.objects.items():
-                name = obj_id.split(":")[-1]  # Use the object name as the variable name
-                globals_dict[name] = obj
-        
-        locals_dict = {}
+        if df.empty:
+            self.logger.warning("Attempting to send empty DataFrame")
+            return False
         
         try:
-            # Execute the code
-            exec(code, globals_dict, locals_dict)
-            result = {
-                "success": True,
-                "locals": {k: v for k, v in locals_dict.items() if not k.startswith("_")},
-                "process_id": self.process_id,
-                "context_name": context.name if context else None
-            }
+            # Convert DataFrame to Arrow table
+            table = pa.Table.from_pandas(df)
+            return self.send_table(key, table, description)
         except Exception as e:
-            result = {
-                "success": False,
-                "error": str(e),
-                "process_id": self.process_id,
-                "context_name": context.name if context else None
+            self.logger.error(f"Failed to convert DataFrame to Arrow table: {e}")
+            return False
+    
+    def send_table(self, key: str, table: pa.Table, 
+                   description: str = "Arrow table from Python") -> bool:
+        """
+        Send an Arrow table to the server.
+        
+        Args:
+            key: Unique identifier for the data
+            table: Arrow table to send
+            description: Description of the data
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        with self._handle_flight_errors(f"sending table '{key}'"):
+            # Create flight descriptor
+            descriptor = flight.FlightDescriptor.for_path(key)
+            
+            # Create metadata headers
+            headers = [
+                (b"description", description.encode()),
+                (b"sender_id", self.sender_id.encode())
+            ]
+            
+            # Convert table to record batches
+            batches = table.to_batches()
+            
+            # Send data to server
+            writer, _ = self.client.do_put(descriptor, table.schema, headers)
+            
+            with writer:
+                for batch in batches:
+                    writer.write_batch(batch)
+            
+            self.logger.info(f"Successfully sent table '{key}' "
+                           f"({table.num_rows} rows, {table.num_columns} columns)")
+            return True
+    
+    def get_dataframe(self, key: str) -> Optional[pd.DataFrame]:
+        """
+        Retrieve a pandas DataFrame from the server.
+        
+        Args:
+            key: Identifier of the data to retrieve
+            
+        Returns:
+            pandas DataFrame or None if not found
+        """
+        table = self.get_table(key)
+        if table is None:
+            return None
+        
+        try:
+            df = table.to_pandas()
+            self.logger.info(f"Retrieved DataFrame '{key}' "
+                           f"({len(df)} rows, {len(df.columns)} columns)")
+            return df
+        except Exception as e:
+            self.logger.error(f"Failed to convert Arrow table to DataFrame: {e}")
+            return None
+    
+    def get_table(self, key: str) -> Optional[pa.Table]:
+        """
+        Retrieve an Arrow table from the server.
+        
+        Args:
+            key: Identifier of the data to retrieve
+            
+        Returns:
+            Arrow table or None if not found
+        """
+        with self._handle_flight_errors(f"retrieving table '{key}'"):
+            # Create ticket for the data
+            ticket = flight.Ticket(key.encode())
+            
+            # Get data stream
+            reader = self.client.do_get(ticket)
+            
+            # Read all batches and convert to table
+            batches = []
+            for chunk in reader:
+                batches.append(chunk.data)
+            
+            if not batches:
+                self.logger.warning(f"No data found for key '{key}'")
+                return None
+            
+            table = pa.Table.from_batches(batches)
+            self.logger.info(f"Retrieved table '{key}' "
+                           f"({table.num_rows} rows, {table.num_columns} columns)")
+            return table
+    
+    def list_tables(self) -> List[Dict[str, Any]]:
+        """
+        List all available tables on the server.
+        
+        Returns:
+            List of dictionaries with table information
+        """
+        with self._handle_flight_errors("listing tables"):
+            flights = list(self.client.list_flights())
+            
+            tables = []
+            for flight_info in flights:
+                if flight_info.descriptor.path:
+                    table_info = {
+                        'key': flight_info.descriptor.path[0],
+                        'schema': flight_info.schema,
+                        'total_records': flight_info.total_records,
+                        'total_bytes': flight_info.total_bytes,
+                        'endpoints': len(flight_info.endpoints)
+                    }
+                    tables.append(table_info)
+            
+            self.logger.info(f"Found {len(tables)} tables on server")
+            return tables
+    
+    def get_server_stats(self) -> Dict[str, Any]:
+        """
+        Get server statistics and information about stored tables.
+        
+        Returns:
+            Dictionary with server statistics
+        """
+        with self._handle_flight_errors("getting server statistics"):
+            action = flight.Action("get_stats", b"")
+            results = list(self.client.do_action(action))
+            
+            if results:
+                stats_json = results[0].body.to_pybytes().decode()
+                return json.loads(stats_json)
+            
+            return {}
+    
+    def clear_server(self) -> bool:
+        """
+        Clear all stored tables from the server.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        with self._handle_flight_errors("clearing server"):
+            action = flight.Action("clear_all", b"")
+            results = list(self.client.do_action(action))
+            
+            if results:
+                response = results[0].body.to_pybytes().decode()
+                self.logger.info(f"Server response: {response}")
+                return True
+            
+            return False
+    
+    def table_exists(self, key: str) -> bool:
+        """
+        Check if a table exists on the server.
+        
+        Args:
+            key: Table identifier to check
+            
+        Returns:
+            True if table exists, False otherwise
+        """
+        try:
+            descriptor = flight.FlightDescriptor.for_path(key)
+            self.client.get_flight_info(descriptor)
+            return True
+        except flight.FlightError:
+            return False
+    
+    def wait_for_table(self, key: str, timeout: float = 30.0, 
+                      poll_interval: float = 0.5) -> bool:
+        """
+        Wait for a table to become available on the server.
+        
+        Args:
+            key: Table identifier to wait for
+            timeout: Maximum time to wait in seconds
+            poll_interval: Time between checks in seconds
+            
+        Returns:
+            True if table becomes available, False if timeout
+        """
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            if self.table_exists(key):
+                self.logger.info(f"Table '{key}' is now available")
+                return True
+            
+            time.sleep(poll_interval)
+        
+        self.logger.warning(f"Timeout waiting for table '{key}'")
+        return False
+    
+    def get_table_info(self, key: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information about a specific table.
+        
+        Args:
+            key: Table identifier
+            
+        Returns:
+            Dictionary with table information or None if not found
+        """
+        try:
+            descriptor = flight.FlightDescriptor.for_path(key)
+            flight_info = self.client.get_flight_info(descriptor)
+            
+            return {
+                'key': key,
+                'schema': flight_info.schema,
+                'total_records': flight_info.total_records,
+                'total_bytes': flight_info.total_bytes,
+                'endpoints': len(flight_info.endpoints),
+                'columns': [field.name for field in flight_info.schema],
+                'column_types': [str(field.type) for field in flight_info.schema]
             }
-        
-        return result
+        except flight.FlightError:
+            return None
+
+
+class ArrowFlightDataExchange:
+    """
+    High-level utility class for data exchange between Python processes
+    using the ArrowFlight relay server.
+    """
     
-    def terminate(self) -> None:
-        """Terminate this process."""
-        print(f"Terminating process: {self.process_id}")
-        self.running = False
-        # In a real implementation, this would terminate the actual process
-
-
-class Context:
-    def __init__(self, bookkeeper: BookKeeper, name: str):
-        """Initialize an execution context.
-        
-        Args:
-            bookkeeper: The BookKeeper instance
-            name: The name of the context
+    def __init__(self, host: str = "localhost", port: int = 8080,
+                 process_id: Optional[str] = None):
         """
-        self.bookkeeper = bookkeeper
-        self.name = name
-        self.objects: Dict[str, Any] = {}
-    
-    def register(self, obj: Any, name: str) -> str:
-        """Register an object in this context.
+        Initialize the data exchange utility.
         
         Args:
-            obj: The object to register
-            name: The name of the object
+            host: Server hostname
+            port: Server port
+            process_id: Unique identifier for this process
+        """
+        self.process_id = process_id or f"process_{uuid.uuid4().hex[:8]}"
+        self.client = ArrowFlightClient(host, port, sender_id=self.process_id)
+        
+        # Setup logging
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(f"DataExchange-{self.process_id}")
+    
+    def publish(self, channel: str, data: Union[pd.DataFrame, pa.Table],
+               description: str = "Published data") -> bool:
+        """
+        Publish data to a named channel.
+        
+        Args:
+            channel: Channel name
+            data: Data to publish (DataFrame or Arrow table)
+            description: Description of the data
             
         Returns:
-            The object ID
+            True if successful, False otherwise
         """
-        object_id = f"{self.name}:{name}"
-        print(f"Registering object in context {self.name}: {name}")
-        self.objects[object_id] = obj
-        return object_id
+        if isinstance(data, pd.DataFrame):
+            return self.client.send_dataframe(channel, data, description)
+        elif isinstance(data, pa.Table):
+            return self.client.send_table(channel, data, description)
+        else:
+            raise TypeError("Data must be pandas DataFrame or Arrow Table")
     
-    def get(self, name: str) -> Any:
-        """Get an object by name from this context.
+    def subscribe(self, channel: str, as_dataframe: bool = True) -> Optional[Union[pd.DataFrame, pa.Table]]:
+        """
+        Subscribe to data from a named channel.
         
         Args:
-            name: The name of the object
+            channel: Channel name
+            as_dataframe: If True, return pandas DataFrame; if False, return Arrow table
             
         Returns:
-            The object
+            Data from the channel or None if not available
         """
-        object_id = f"{self.name}:{name}"
-        if object_id not in self.objects:
-            raise ValueError(f"Object {name} not found in context {self.name}")
-        return self.objects[object_id]
+        if as_dataframe:
+            return self.client.get_dataframe(channel)
+        else:
+            return self.client.get_table(channel)
     
-    def execute(self, code: str, process_id: Optional[str] = None) -> Dict[str, Any]:
-        """Execute code in this context.
+    def wait_and_subscribe(self, channel: str, timeout: float = 30.0,
+                          as_dataframe: bool = True) -> Optional[Union[pd.DataFrame, pa.Table]]:
+        """
+        Wait for data to become available on a channel and then subscribe.
         
         Args:
-            code: The Python code to execute
-            process_id: Optional process ID to execute in
+            channel: Channel name
+            timeout: Maximum time to wait
+            as_dataframe: If True, return pandas DataFrame; if False, return Arrow table
             
         Returns:
-            The execution result
+            Data from the channel or None if timeout
         """
-        if not process_id:
-            # Use the first available process
-            process_ids = self.bookkeeper.list_processes()
-            if not process_ids:
-                raise ValueError("No processes available")
-            process_id = process_ids[0]
-        
-        return self.bookkeeper.execute(process_id, code, self.name)
-
-
-def demo_bookkeeper_object_transfer():
-    """Demonstrate how BookKeeper enables object transfer between processes."""
-    print("=" * 80)
-    print("BookKeeper Demo: Inter-Process Object Transfer")
-    print("=" * 80)
+        if self.client.wait_for_table(channel, timeout):
+            return self.subscribe(channel, as_dataframe)
+        return None
     
-    # Create a BookKeeper instance
-    bk = BookKeeper()
-    bk.initialize()
+    def list_channels(self) -> List[str]:
+        """
+        List all available data channels.
+        
+        Returns:
+            List of channel names
+        """
+        tables = self.client.list_tables()
+        return [table['key'] for table in tables]
+    
+    def get_server_status(self) -> Dict[str, Any]:
+        """
+        Get server status and statistics.
+        
+        Returns:
+            Dictionary with server information
+        """
+        return self.client.get_server_stats()
+
+
+def main():
+    """Example usage of the ArrowFlight client."""
+    import numpy as np
+    
+    # Create sample data
+    df = pd.DataFrame({
+        'id': range(1000),
+        'value': np.random.randn(1000),
+        'category': np.random.choice(['A', 'B', 'C'], 1000),
+        'timestamp': pd.date_range('2024-01-01', periods=1000, freq='1H')
+    })
     
     try:
-        # Create two processes
-        process1_id = bk.create_process("data_producer")
-        process2_id = bk.create_process("data_consumer")
+        # Initialize client
+        print("🚀 Connecting to ArrowFlight server...")
+        client = ArrowFlightClient()
         
-        print("\n1. Create a DataFrame in process1")
-        result1 = bk.execute(process1_id, """
-# Create a sample DataFrame
-df = pd.DataFrame({
-    'A': np.random.rand(5),
-    'B': np.random.rand(5),
-    'C': np.random.randint(0, 10, 5)
-})
-print(f"Created DataFrame in {process_id}:")
-print(df)
-
-# Register the DataFrame with BookKeeper
-object_id = bookkeeper.register_object(df, "sample_dataframe")
-print(f"Registered DataFrame with ID: {object_id}")
-        """)
+        # Send DataFrame
+        print("📤 Sending sample DataFrame...")
+        success = client.send_dataframe(
+            "sample_data", 
+            df, 
+            "Sample data with 1000 rows"
+        )
+        print(f"   Send result: {'✅ Success' if success else '❌ Failed'}")
         
-        if not result1["success"]:
-            print(f"Error in process1: {result1['error']}")
-            return
+        # List tables
+        print("\n📋 Available tables:")
+        tables = client.list_tables()
+        for table in tables:
+            print(f"   • {table['key']}: {table['total_records']} records")
         
-        print("\n2. Retrieve and modify the DataFrame in process2")
-        result2 = bk.execute(process2_id, """
-# Get the DataFrame from BookKeeper
-df = bookkeeper.get_object("default:sample_dataframe")
-print(f"Retrieved DataFrame in {process_id}:")
-print(df)
-
-# Modify the DataFrame
-df['D'] = df['A'] + df['B']
-print("Modified DataFrame:")
-print(df)
-
-# Register the modified DataFrame
-object_id = bookkeeper.register_object(df, "modified_dataframe")
-print(f"Registered modified DataFrame with ID: {object_id}")
-        """)
+        # Retrieve DataFrame
+        print("\n📥 Retrieving DataFrame...")
+        retrieved_df = client.get_dataframe("sample_data")
+        if retrieved_df is not None:
+            print(f"   ✅ Retrieved DataFrame: {len(retrieved_df)} rows, {len(retrieved_df.columns)} columns")
+            print(f"   Sample data:\n{retrieved_df.head()}")
+        else:
+            print("   ❌ Failed to retrieve DataFrame")
         
-        if not result2["success"]:
-            print(f"Error in process2: {result2['error']}")
-            return
+        # Get server stats
+        print("\n📊 Server statistics:")
+        stats = client.get_server_stats()
+        print(f"   Stored tables: {stats.get('stored_tables', 'unknown')}")
+        print(f"   Max capacity: {stats.get('max_capacity', 'unknown')}")
         
-        print("\n3. Use contexts for object management")
-        # Create a context
-        context = bk.create_context("analysis_context")
+        # Example of high-level data exchange
+        print("\n🔄 Testing high-level data exchange...")
+        exchange = ArrowFlightDataExchange()
         
-        # Register objects in the context
-        df = bk.get_object("default:modified_dataframe")
-        context.register(df, "input_data")
+        # Publish data
+        sample_data = pd.DataFrame({
+            'x': np.random.randn(100),
+            'y': np.random.randn(100)
+        })
         
-        # Execute code in the context
-        result3 = context.execute("""
-# The DataFrame is already available as input_data
-print(f"Working with DataFrame in context {context.name}:")
-print(input_data)
-
-# Perform analysis
-summary = {
-    'mean': input_data.mean().to_dict(),
-    'sum': input_data.sum().to_dict(),
-    'count': len(input_data)
-}
-print("Analysis results:")
-print(summary)
-
-# Register the results in the context
-context.register(summary, "analysis_results")
-        """, process1_id)
+        exchange.publish("test_channel", sample_data, "Test data for exchange")
         
-        if not result3["success"]:
-            print(f"Error in context execution: {result3['error']}")
-            return
+        # Subscribe to data
+        received_data = exchange.subscribe("test_channel")
+        if received_data is not None:
+            print(f"   ✅ Data exchange successful: {len(received_data)} rows")
+        else:
+            print("   ❌ Data exchange failed")
         
-        print("\n4. Access context objects from another process")
-        result4 = bk.execute(process2_id, """
-# Get the context
-context = bookkeeper.get_context("analysis_context")
-if not context:
-    print("Context not found")
-else:
-    # Get the analysis results
-    results = context.get("analysis_results")
-    print(f"Retrieved analysis results in {process_id}:")
-    print(results)
-    
-    # Create a visualization (simulated)
-    print("Creating visualization based on analysis results...")
-    for key, value in results['mean'].items():
-        print(f"Column {key}: {'*' * int(value * 10)}")
-        """)
+        print("\n🎉 All tests completed!")
         
-        if not result4["success"]:
-            print(f"Error accessing context: {result4['error']}")
-            return
-        
-        print("\n5. Execute code with dependencies between processes")
-        # Create a new context for a workflow
-        workflow = bk.create_context("workflow_context")
-        
-        # Step 1: Generate data in process1
-        workflow.execute("""
-import numpy as np
-
-# Generate time series data
-timestamps = pd.date_range('2025-01-01', periods=100, freq='D')
-values = np.sin(np.linspace(0, 10, 100)) + np.random.normal(0, 0.1, 100)
-
-
-time_series = pd.DataFrame({
-    'timestamp': timestamps,
-    'value': values
-})
-
-# Register in the workflow context
-context.register(time_series, "time_series_data")
-print(f"Generated time series data in {process_id}")
-print(time_series.head())
-        """, process1_id)
-        
-        # Step 2: Process data in process2
-        workflow.execute("""
-# The time series data is available in the context
-data = context.get("time_series_data")
-
-# Process the data - calculate rolling average
-data['rolling_avg'] = data['value'].rolling(window=7).mean()
-
-# Register the processed data
-context.register(data, "processed_data")
-print(f"Processed time series data in {process_id}")
-print(data.head(10))
-        """, process2_id)
-        
-        # Step 3: Analyze results in process1
-        workflow.execute("""
-# Get the processed data
-data = context.get("processed_data")
-
-# Analyze the results
-correlation = data['value'].corr(data['rolling_avg'])
-stats = {
-    'correlation': correlation,
-    'min': data['value'].min(),
-    'max': data['value'].max(),
-    'std_dev': data['value'].std()
-}
-
-print(f"Analysis complete in {process_id}:")
-print(stats)
-
-# Final result
-context.register(stats, "final_stats")
-        """, process1_id)
-        
-        # Get the final results
-        final_stats = workflow.get("final_stats")
-        print("\nFinal workflow results:")
-        for key, value in final_stats.items():
-            print(f"  {key}: {value}")
-        
-    finally:
-        # Shutdown BookKeeper
-        print("\nShutting down BookKeeper")
-        bk.shutdown()
+    except Exception as e:
+        print(f"❌ Error: {e}")
 
 
 if __name__ == "__main__":
-    demo_bookkeeper_object_transfer()
+    main()
+
+cmake_minimum_required(VERSION 3.16)
+project(ArrowFlightRelayServer)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find required packages
+find_package(Arrow REQUIRED)
+find_package(ArrowFlight REQUIRED)
+find_package(Threads REQUIRED)
+
+# Include directories
+include_directories(${ARROW_INCLUDE_DIR})
+
+# Add executable
+add_executable(arrow_flight_server
+    arrow_flight_server.cpp
+)
+
+# Link libraries
+target_link_libraries(arrow_flight_server
+    PRIVATE
+    Arrow::arrow_shared
+    ArrowFlight::arrow_flight_shared
+    Threads::Threads
+)
+
+# Compiler-specific options
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(arrow_flight_server PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -O3
+    )
+endif()
+
+# Set output directory
+set_target_properties(arrow_flight_server PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Print build information
+message(STATUS "Building ArrowFlight Relay Server")
+message(STATUS "Arrow version: ${Arrow_VERSION}")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# Installation
+install(TARGETS arrow_flight_server
+    RUNTIME DESTINATION bin
+)
+
+# Create a simple script to run the server
+configure_file(
+    "${CMAKE_SOURCE_DIR}/run_server.sh.in"
+    "${CMAKE_BINARY_DIR}/run_server.sh"
+    @ONLY
+)
+
+# Make the script executable
+if(UNIX)
+    execute_process(
+        COMMAND chmod +x "${CMAKE_BINARY_DIR}/run_server.sh"
+    )
+endif()
+
+#!/usr/bin/env python3
+"""
+Examples demonstrating how different Python processes can communicate
+through the ArrowFlight relay server.
+"""
+
+import pandas as pd
+import numpy as np
+import time
+import multiprocessing as mp
+import threading
+import argparse
+import sys
+from typing import Optional
+
+# Import our client (assuming it's in the same directory)
+from arrow_flight_client import ArrowFlightClient, ArrowFlightDataExchange
+
+
+def data_producer_process(process_id: str, num_batches: int = 5, delay: float = 2.0):
+    """
+    Simulates a data producer process that generates and sends data periodically.
+    """
+    print(f"🏭 Producer {process_id} starting...")
+    
+    try:
+        # Initialize client
+        client = ArrowFlightClient(sender_id=f"producer_{process_id}")
+        
+        for i in range(num_batches):
+            # Generate sample data
+            data = pd.DataFrame({
+                'batch_id': [i] * 100,
+                'timestamp': pd.date_range('2024-01-01', periods=100, freq='1s'),
+                'sensor_value': np.random.randn(100) * 10 + 50,
+                'sensor_id': np.random.choice(['sensor_A', 'sensor_B', 'sensor_C'], 100),
+                'producer_id': [process_id] * 100
+            })
+            
+            # Send data with a unique key
+            key = f"data_batch_{process_id}_{i}"
+            success = client.send_dataframe(
+                key, 
+                data, 
+                f"Batch {i} from producer {process_id}"
+            )
+            
+            if success:
+                print(f"🟢 Producer {process_id} sent batch {i}")
+            else:
+                print(f"🔴 Producer {process_id} failed to send batch {i}")
+            
+            # Send data to a shared channel as well
+            shared_key = f"live_feed"
+            client.send_dataframe(
+                shared_key,
+                data,
+                f"Live data from {process_id} batch {i}"
+            )
+            
+            time.sleep(delay)
+        
+        print(f"✅ Producer {process_id} completed")
+        
+    except Exception as e:
+        print(f"❌ Producer {process_id} error: {e}")
+
+
+def data_consumer_process(process_id: str, keys_to_watch: list, timeout: float = 30.0):
+    """
+    Simulates a data consumer process that retrieves and processes data.
+    """
+    print(f"🔍 Consumer {process_id} starting...")
+    
+    try:
+        # Initialize client
+        client = ArrowFlightClient(sender_id=f"consumer_{process_id}")
+        
+        for key in keys_to_watch:
+            print(f"   Waiting for data: {key}")
+            
+            # Wait for data to become available
+            if client.wait_for_table(key, timeout):
+                # Retrieve and process data
+                df = client.get_dataframe(key)
+                if df is not None:
+                    # Simple processing: calculate statistics
+                    stats = {
+                        'key': key,
+                        'rows': len(df),
+                        'mean_sensor_value': df['sensor_value'].mean() if 'sensor_value' in df.columns else None,
+                        'unique_sensors': df['sensor_id'].nunique() if 'sensor_id' in df.columns else None
+                    }
+                    
+                    print(f"🟢 Consumer {process_id} processed {key}: {stats}")
+                    
+                    # Optionally save processed results back to server
+                    result_key = f"processed_{key}_{process_id}"
+                    result_df = pd.DataFrame([stats])
+                    client.send_dataframe(
+                        result_key,
+                        result_df,
+                        f"Processed results by consumer {process_id}"
+                    )
+                else:
+                    print(f"🔴 Consumer {process_id} failed to retrieve {key}")
+            else:
+                print(f"⏰ Consumer {process_id} timeout waiting for {key}")
+        
+        print(f"✅ Consumer {process_id} completed")
+        
+    except Exception as e:
+        print(f"❌ Consumer {process_id} error: {e}")
+
+
+def live_monitor_process(monitor_id: str, channel: str = "live_feed", duration: float = 20.0):
+    """
+    Simulates a monitoring process that continuously watches for live data.
+    """
+    print(f"📊 Monitor {monitor_id} starting (watching {channel})...")
+    
+    try:
+        # Initialize data exchange
+        exchange = ArrowFlightDataExchange(process_id=f"monitor_{monitor_id}")
+        
+        start_time = time.time()
+        last_data_time = {}
+        
+        while time.time() - start_time < duration:
+            # Check for new data
+            data = exchange.subscribe(channel, as_dataframe=True)
+            
+            if data is not None:
+                # Check if this is new data
+                data_hash = str(hash(str(data.values.tobytes())))
+                current_time = time.time()
+                
+                if data_hash not in last_data_time:
+                    last_data_time[data_hash] = current_time
+                    
+                    # Process live data
+                    latest_value = data['sensor_value'].iloc[-1] if len(data) > 0 else None
+                    producer = data['producer_id'].iloc[0] if len(data) > 0 else 'unknown'
+                    
+                    print(f"🔴 Monitor {monitor_id} - Live data from {producer}: "
+                          f"latest value = {latest_value:.2f}")
+                    
+                    # Save monitoring results
+                    monitoring_data = pd.DataFrame({
+                        'monitor_time': [current_time],
+                        'data_source': [producer],
+                        'latest_sensor_value': [latest_value],
+                        'data_points': [len(data)]
+                    })
+                    
+                    exchange.publish(
+                        f"monitoring_results_{monitor_id}",
+                        monitoring_data,
+                        f"Monitoring results from {monitor_id}"
+                    )
+            
+            time.sleep(1.0)  # Check every second
+        
+        print(f"✅ Monitor {monitor_id} completed")
+        
+    except Exception as e:
+        print(f"❌ Monitor {monitor_id} error: {e}")
+
+
+def aggregator_process(aggregator_id: str, wait_time: float = 15.0):
+    """
+    Simulates an aggregator process that collects data from multiple sources.
+    """
+    print(f"📈 Aggregator {aggregator_id} starting...")
+    
+    try:
+        # Initialize client
+        client = ArrowFlightClient(sender_id=f"aggregator_{aggregator_id}")
+        
+        # Wait for some data to accumulate
+        time.sleep(wait_time)
+        
+        # Get all available tables
+        tables = client.list_tables()
+        print(f"   Found {len(tables)} tables on server")
+        
+        # Collect all data that matches our pattern
+        all_data = []
+        for table_info in tables:
+            key = table_info['key']
+            if 'data_batch_' in key:  # Only process batch data
+                df = client.get_dataframe(key)
+                if df is not None:
+                    all_data.append(df)
+        
+        if all_data:
+            # Aggregate all data
+            combined_df = pd.concat(all_data, ignore_index=True)
+            
+            # Calculate aggregate statistics
+            aggregated_stats = pd.DataFrame({
+                'total_rows': [len(combined_df)],
+                'unique_producers': [combined_df['producer_id'].nunique()],
+                'mean_sensor_value': [combined_df['sensor_value'].mean()],
+                'std_sensor_value': [combined_df['sensor_value'].std()],
+                'min_sensor_value': [combined_df['sensor_value'].min()],
+                'max_sensor_value': [combined_df['sensor_value'].max()],
+                'aggregation_time': [time.time()]
+            })
+            
+            # Send aggregated results
+            success = client.send_dataframe(
+                f"aggregated_results_{aggregator_id}",
+                aggregated_stats,
+                f"Aggregated statistics by {aggregator_id}"
+            )
+            
+            if success:
+                print(f"🟢 Aggregator {aggregator_id} processed {len(all_data)} datasets")
+                print(f"   Total rows: {len(combined_df)}")
+                print(f"   Mean sensor value: {combined_df['sensor_value'].mean():.2f}")
+            else:
+                print(f"🔴 Aggregator {aggregator_id} failed to send results")
+        else:
+            print(f"⚠️  Aggregator {aggregator_id} found no data to process")
+        
+        print(f"✅ Aggregator {aggregator_id} completed")
+        
+    except Exception as e:
+        print(f"❌ Aggregator {aggregator_id} error: {e}")
+
+
+def run_multi_process_example():
+    """
+    Run a complete multi-process example demonstrating the relay server.
+    """
+    print("🚀 Starting Multi-Process ArrowFlight Relay Example")
+    print("=" * 60)
+    
+    # Test server connection first
+    try:
+        test_client = ArrowFlightClient()
+        print("✅ Server connection successful")
+    except Exception as e:
+        print(f"❌ Cannot connect to server: {e}")
+        print("   Make sure the C++ ArrowFlight server is running!")
+        return
+    
+    # Clear any existing data
+    test_client.clear_server()
+    print("🧹 Cleared existing data from server")
+    
+    processes = []
+    
+    try:
+        # Start producer processes
+        for i in range(2):
+            p = mp.Process(
+                target=data_producer_process,
+                args=(f"P{i}", 3, 2.0)  # 3 batches, 2 second delay
+            )
+            p.start()
+            processes.append(p)
+        
+        # Start monitor process
+        monitor_p = mp.Process(
+            target=live_monitor_process,
+            args=("M1", "live_feed", 15.0)  # Monitor for 15 seconds
+        )
+        monitor_p.start()
+        processes.append(monitor_p)
+        
+        # Start consumer processes (they will wait for specific data)
+        keys_to_consume = [
+            ["data_batch_P0_0", "data_batch_P0_1"],
+            ["data_batch_P1_0", "data_batch_P1_2"]
+        ]
+        
+        for i, keys in enumerate(keys_to_consume):
+            p = mp.Process(
+                target=data_consumer_process,
+                args=(f"C{i}", keys, 30.0)
+            )
+            p.start()
+            processes.append(p)
+        
+        # Start aggregator process
+        agg_p = mp.Process(
+            target=aggregator_process,
+            args=("A1", 10.0)  # Wait 10 seconds before aggregating
+        )
+        agg_p.start()
+        processes.append(agg_p)
+        
+        # Wait for all processes to complete
+        for p in processes:
+            p.join()
+        
+        print("\n📊 Final Server Statistics:")
+        print("=" * 40)
+        stats = test_client.get_server_stats()
+        print(f"Total stored tables: {stats.get('stored_tables', 'unknown')}")
+        
+        for table_info in stats.get('tables', []):
+            print(f"  • {table_info['key']}: {table_info['rows']} rows, "
+                  f"age {table_info['age_seconds']}s")
+        
+        print("\n🎉 Multi-process example completed successfully!")
+        
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+
+
+def run_simple_example():
+    """
+    Run a simple single-process example.
+    """
+    print("🚀 Starting Simple ArrowFlight Example")
+    print("=" * 40)
+    
+    try:
+        # Initialize data exchange
+        exchange = ArrowFlightDataExchange(process_id="simple_example")
+        
+        # Create sample data
+        sample_data = pd.DataFrame({
+            'id': range(100),
+            'value': np.random.randn(100),
+            'category': np.random.choice(['A', 'B', 'C'], 100)
+        })
+        
+        # Publish data
+        print("📤 Publishing sample data...")
+        success = exchange.publish("simple_channel", sample_data, "Simple example data")
+        print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
+        
+        # Subscribe to data
+        print("📥 Subscribing to data...")
+        retrieved_data = exchange.subscribe("simple_channel")
+        
+        if retrieved_data is not None:
+            print(f"   ✅ Retrieved {len(retrieved_data)} rows")
+            print(f"   Sample: {retrieved_data.head()}")
+        else:
+            print("   ❌ Failed to retrieve data")
+        
+        # List channels
+        channels = exchange.list_channels()
+        print(f"📋 Available channels: {channels}")
+        
+        # Get server status
+        status = exchange.get_server_status()
+        print(f"📊 Server has {status.get('stored_tables', 0)} stored tables")
+        
+        print("🎉 Simple example completed!")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+
+def main():
+    """
+    Main function with command line argument parsing.
+    """
+    parser = argparse.ArgumentParser(description="ArrowFlight Relay Examples")
+    parser.add_argument(
+        "--mode",
+        choices=["simple", "multi", "producer", "consumer", "monitor", "aggregator"],
+        default="simple",
+        help="Example mode to run"
+    )
+    parser.add_argument("--id", default="1", help="Process ID")
+    parser.add_argument("--keys", nargs="*", help="Keys to watch (for consumer)")
+    parser.add_argument("--channel", default="live_feed", help="Channel to monitor")
+    parser.add_argument("--duration", type=float, default=20.0, help="Duration to run")
+    
+    args = parser.parse_args()
+    
+    if args.mode == "simple":
+        run_simple_example()
+    elif args.mode == "multi":
+        run_multi_process_example()
+    elif args.mode == "producer":
+        data_producer_process(args.id)
+    elif args.mode == "consumer":
+        keys = args.keys or [f"data_batch_{args.id}_0"]
+        data_consumer_process(args.id, keys)
+    elif args.mode == "monitor":
+        live_monitor_process(args.id, args.channel, args.duration)
+    elif args.mode == "aggregator":
+        aggregator_process(args.id)
+    else:
+        print(f"Unknown mode: {args.mode}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
