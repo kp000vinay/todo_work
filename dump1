@@ -1,482 +1,638 @@
 #!/usr/bin/env python3
 """
-ArrowFlight Python Client for communicating with the C++ relay server.
-Supports sending and receiving pandas DataFrames and Arrow tables.
+Examples demonstrating how different Python processes can communicate
+through the ArrowFlight relay server.
 """
 
-import pyarrow as pa
-import pyarrow.flight as flight
 import pandas as pd
-import json
-import uuid
+import numpy as np
 import time
-from typing import Dict, List, Optional, Union, Any, Tuple
-from contextlib import contextmanager
-import logging
+import multiprocessing as mp
+import threading
+import argparse
+import sys
+from typing import Optional
+
+# Import our client (assuming it's in the same directory)
+from arrow_flight_client import ArrowFlightClient, ArrowFlightDataExchange
 
 
-class ArrowFlightClient:
+def data_producer_process(process_id: str, num_batches: int = 5, delay: float = 2.0):
     """
-    Python client for the ArrowFlight relay server.
-    Handles conversion between pandas DataFrames and Arrow tables.
+    Simulates a data producer process that generates and sends data periodically.
     """
-    
-    def __init__(self, host: str = "localhost", port: int = 8080, 
-                 sender_id: Optional[str] = None, timeout: float = 30.0):
-        """
-        Initialize the ArrowFlight client.
-        
-        Args:
-            host: Server hostname
-            port: Server port
-            sender_id: Unique identifier for this client
-            timeout: Connection timeout in seconds
-        """
-        self.host = host
-        self.port = port
-        self.sender_id = sender_id or f"client_{uuid.uuid4().hex[:8]}"
-        self.timeout = timeout
-        
-        # Create flight client
-        location = flight.Location.for_grpc_tcp(host, port)
-        self.client = flight.FlightClient(location)
-        
-        # Setup logging
-        self.logger = logging.getLogger(f"ArrowFlightClient-{self.sender_id}")
-        
-        # Test connection
-        self._test_connection()
-    
-    def _test_connection(self) -> None:
-        """Test connection to the server."""
-        try:
-            list(self.client.list_flights())
-            self.logger.info(f"Connected to ArrowFlight server at {self.host}:{self.port}")
-        except Exception as e:
-            raise ConnectionError(f"Failed to connect to server: {e}")
-    
-    @contextmanager
-    def _handle_flight_errors(self, operation: str):
-        """Context manager for handling Flight errors with meaningful messages."""
-        try:
-            yield
-        except flight.FlightError as e:
-            self.logger.error(f"{operation} failed: {e}")
-            raise
-        except Exception as e:
-            self.logger.error(f"Unexpected error during {operation}: {e}")
-            raise
-    
-    def send_dataframe(self, key: str, df: pd.DataFrame, 
-                      description: str = "DataFrame from Python") -> bool:
-        """
-        Send a pandas DataFrame to the server.
-        
-        Args:
-            key: Unique identifier for the data
-            df: pandas DataFrame to send
-            description: Description of the data
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if df.empty:
-            self.logger.warning("Attempting to send empty DataFrame")
-            return False
-        
-        try:
-            # Convert DataFrame to Arrow table
-            table = pa.Table.from_pandas(df)
-            return self.send_table(key, table, description)
-        except Exception as e:
-            self.logger.error(f"Failed to convert DataFrame to Arrow table: {e}")
-            return False
-    
-    def send_table(self, key: str, table: pa.Table, 
-                   description: str = "Arrow table from Python") -> bool:
-        """
-        Send an Arrow table to the server.
-        
-        Args:
-            key: Unique identifier for the data
-            table: Arrow table to send
-            description: Description of the data
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        with self._handle_flight_errors(f"sending table '{key}'"):
-            # Encode metadata in descriptor path: [key, description, sender_id]
-            # Clean strings to avoid path issues
-            clean_description = description.replace("|", "_").replace("/", "_")
-            clean_sender_id = self.sender_id.replace("|", "_").replace("/", "_")
-            
-            # Create flight descriptor with metadata in path
-            descriptor = flight.FlightDescriptor.for_path(key, clean_description, clean_sender_id)
-            
-            # Convert table to record batches
-            batches = table.to_batches()
-            
-            # Send data to server
-            writer, _ = self.client.do_put(descriptor, table.schema)
-            
-            with writer:
-                for batch in batches:
-                    writer.write_batch(batch)
-            
-            self.logger.info(f"Successfully sent table '{key}' "
-                           f"({table.num_rows} rows, {table.num_columns} columns)")
-            return True
-    
-    def get_dataframe(self, key: str) -> Optional[pd.DataFrame]:
-        """
-        Retrieve a pandas DataFrame from the server.
-        
-        Args:
-            key: Identifier of the data to retrieve
-            
-        Returns:
-            pandas DataFrame or None if not found
-        """
-        table = self.get_table(key)
-        if table is None:
-            return None
-        
-        try:
-            df = table.to_pandas()
-            self.logger.info(f"Retrieved DataFrame '{key}' "
-                           f"({len(df)} rows, {len(df.columns)} columns)")
-            return df
-        except Exception as e:
-            self.logger.error(f"Failed to convert Arrow table to DataFrame: {e}")
-            return None
-    
-    def get_table(self, key: str) -> Optional[pa.Table]:
-        """
-        Retrieve an Arrow table from the server.
-        
-        Args:
-            key: Identifier of the data to retrieve
-            
-        Returns:
-            Arrow table or None if not found
-        """
-        with self._handle_flight_errors(f"retrieving table '{key}'"):
-            # Create ticket for the data
-            ticket = flight.Ticket(key.encode())
-            
-            # Get data stream
-            reader = self.client.do_get(ticket)
-            
-            # Read all batches and convert to table
-            batches = []
-            for chunk in reader:
-                batches.append(chunk.data)
-            
-            if not batches:
-                self.logger.warning(f"No data found for key '{key}'")
-                return None
-            
-            table = pa.Table.from_batches(batches)
-            self.logger.info(f"Retrieved table '{key}' "
-                           f"({table.num_rows} rows, {table.num_columns} columns)")
-            return table
-    
-    def list_tables(self) -> List[Dict[str, Any]]:
-        """
-        List all available tables on the server.
-        
-        Returns:
-            List of dictionaries with table information
-        """
-        with self._handle_flight_errors("listing tables"):
-            flights = list(self.client.list_flights())
-            
-            tables = []
-            for flight_info in flights:
-                if flight_info.descriptor.path:
-                    table_info = {
-                        'key': flight_info.descriptor.path[0],
-                        'schema': flight_info.schema,
-                        'total_records': flight_info.total_records,
-                        'total_bytes': flight_info.total_bytes,
-                        'endpoints': len(flight_info.endpoints)
-                    }
-                    tables.append(table_info)
-            
-            self.logger.info(f"Found {len(tables)} tables on server")
-            return tables
-    
-    def get_server_stats(self) -> Dict[str, Any]:
-        """
-        Get server statistics and information about stored tables.
-        
-        Returns:
-            Dictionary with server statistics
-        """
-        with self._handle_flight_errors("getting server statistics"):
-            action = flight.Action("get_stats", b"")
-            results = list(self.client.do_action(action))
-            
-            if results:
-                stats_json = results[0].body.to_pybytes().decode()
-                return json.loads(stats_json)
-            
-            return {}
-    
-    def clear_server(self) -> bool:
-        """
-        Clear all stored tables from the server.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        with self._handle_flight_errors("clearing server"):
-            action = flight.Action("clear_all", b"")
-            results = list(self.client.do_action(action))
-            
-            if results:
-                response = results[0].body.to_pybytes().decode()
-                self.logger.info(f"Server response: {response}")
-                return True
-            
-            return False
-    
-    def table_exists(self, key: str) -> bool:
-        """
-        Check if a table exists on the server.
-        
-        Args:
-            key: Table identifier to check
-            
-        Returns:
-            True if table exists, False otherwise
-        """
-        try:
-            descriptor = flight.FlightDescriptor.for_path(key)
-            self.client.get_flight_info(descriptor)
-            return True
-        except flight.FlightError:
-            return False
-    
-    def wait_for_table(self, key: str, timeout: float = 30.0, 
-                      poll_interval: float = 0.5) -> bool:
-        """
-        Wait for a table to become available on the server.
-        
-        Args:
-            key: Table identifier to wait for
-            timeout: Maximum time to wait in seconds
-            poll_interval: Time between checks in seconds
-            
-        Returns:
-            True if table becomes available, False if timeout
-        """
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            if self.table_exists(key):
-                self.logger.info(f"Table '{key}' is now available")
-                return True
-            
-            time.sleep(poll_interval)
-        
-        self.logger.warning(f"Timeout waiting for table '{key}'")
-        return False
-    
-    def get_table_info(self, key: str) -> Optional[Dict[str, Any]]:
-        """
-        Get detailed information about a specific table.
-        
-        Args:
-            key: Table identifier
-            
-        Returns:
-            Dictionary with table information or None if not found
-        """
-        try:
-            descriptor = flight.FlightDescriptor.for_path(key)
-            flight_info = self.client.get_flight_info(descriptor)
-            
-            return {
-                'key': key,
-                'schema': flight_info.schema,
-                'total_records': flight_info.total_records,
-                'total_bytes': flight_info.total_bytes,
-                'endpoints': len(flight_info.endpoints),
-                'columns': [field.name for field in flight_info.schema],
-                'column_types': [str(field.type) for field in flight_info.schema]
-            }
-        except flight.FlightError:
-            return None
-
-
-class ArrowFlightDataExchange:
-    """
-    High-level utility class for data exchange between Python processes
-    using the ArrowFlight relay server.
-    """
-    
-    def __init__(self, host: str = "localhost", port: int = 8080,
-                 process_id: Optional[str] = None):
-        """
-        Initialize the data exchange utility.
-        
-        Args:
-            host: Server hostname
-            port: Server port
-            process_id: Unique identifier for this process
-        """
-        self.process_id = process_id or f"process_{uuid.uuid4().hex[:8]}"
-        self.client = ArrowFlightClient(host, port, sender_id=self.process_id)
-        
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(f"DataExchange-{self.process_id}")
-    
-    def publish(self, channel: str, data: Union[pd.DataFrame, pa.Table],
-               description: str = "Published data") -> bool:
-        """
-        Publish data to a named channel.
-        
-        Args:
-            channel: Channel name
-            data: Data to publish (DataFrame or Arrow table)
-            description: Description of the data
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if isinstance(data, pd.DataFrame):
-            return self.client.send_dataframe(channel, data, description)
-        elif isinstance(data, pa.Table):
-            return self.client.send_table(channel, data, description)
-        else:
-            raise TypeError("Data must be pandas DataFrame or Arrow Table")
-    
-    def subscribe(self, channel: str, as_dataframe: bool = True) -> Optional[Union[pd.DataFrame, pa.Table]]:
-        """
-        Subscribe to data from a named channel.
-        
-        Args:
-            channel: Channel name
-            as_dataframe: If True, return pandas DataFrame; if False, return Arrow table
-            
-        Returns:
-            Data from the channel or None if not available
-        """
-        if as_dataframe:
-            return self.client.get_dataframe(channel)
-        else:
-            return self.client.get_table(channel)
-    
-    def wait_and_subscribe(self, channel: str, timeout: float = 30.0,
-                          as_dataframe: bool = True) -> Optional[Union[pd.DataFrame, pa.Table]]:
-        """
-        Wait for data to become available on a channel and then subscribe.
-        
-        Args:
-            channel: Channel name
-            timeout: Maximum time to wait
-            as_dataframe: If True, return pandas DataFrame; if False, return Arrow table
-            
-        Returns:
-            Data from the channel or None if timeout
-        """
-        if self.client.wait_for_table(channel, timeout):
-            return self.subscribe(channel, as_dataframe)
-        return None
-    
-    def list_channels(self) -> List[str]:
-        """
-        List all available data channels.
-        
-        Returns:
-            List of channel names
-        """
-        tables = self.client.list_tables()
-        return [table['key'] for table in tables]
-    
-    def get_server_status(self) -> Dict[str, Any]:
-        """
-        Get server status and statistics.
-        
-        Returns:
-            Dictionary with server information
-        """
-        return self.client.get_server_stats()
-
-
-def main():
-    """Example usage of the ArrowFlight client."""
-    import numpy as np
-    
-    # Create sample data
-    df = pd.DataFrame({
-        'id': range(1000),
-        'value': np.random.randn(1000),
-        'category': np.random.choice(['A', 'B', 'C'], 1000),
-        'timestamp': pd.date_range('2024-01-01', periods=1000, freq='1H')
-    })
+    print(f"🏭 Producer {process_id} starting...")
     
     try:
         # Initialize client
-        print("🚀 Connecting to ArrowFlight server...")
-        client = ArrowFlightClient()
+        client = ArrowFlightClient(sender_id=f"producer_{process_id}")
         
-        # Send DataFrame
-        print("📤 Sending sample DataFrame...")
-        success = client.send_dataframe(
-            "sample_data", 
-            df, 
-            "Sample data with 1000 rows"
-        )
-        print(f"   Send result: {'✅ Success' if success else '❌ Failed'}")
+        for i in range(num_batches):
+            # Generate sample data
+            data = pd.DataFrame({
+                'batch_id': [i] * 100,
+                'timestamp': pd.date_range('2024-01-01', periods=100, freq='1s'),
+                'sensor_value': np.random.randn(100) * 10 + 50,
+                'sensor_id': np.random.choice(['sensor_A', 'sensor_B', 'sensor_C'], 100),
+                'producer_id': [process_id] * 100
+            })
+            
+            # Send data with a unique key
+            key = f"data_batch_{process_id}_{i}"
+            success = client.send_dataframe(
+                key, 
+                data, 
+                f"Batch {i} from producer {process_id}"
+            )
+            
+            if success:
+                print(f"🟢 Producer {process_id} sent batch {i}")
+            else:
+                print(f"🔴 Producer {process_id} failed to send batch {i}")
+            
+            # Send data to a shared channel as well
+            shared_key = f"live_feed"
+            client.send_dataframe(
+                shared_key,
+                data,
+                f"Live data from {process_id} batch {i}"
+            )
+            
+            time.sleep(delay)
         
-        # List tables
-        print("\n📋 Available tables:")
-        tables = client.list_tables()
-        for table in tables:
-            print(f"   • {table['key']}: {table['total_records']} records")
+        print(f"✅ Producer {process_id} completed")
         
-        # Retrieve DataFrame
-        print("\n📥 Retrieving DataFrame...")
-        retrieved_df = client.get_dataframe("sample_data")
-        if retrieved_df is not None:
-            print(f"   ✅ Retrieved DataFrame: {len(retrieved_df)} rows, {len(retrieved_df.columns)} columns")
-            print(f"   Sample data:\n{retrieved_df.head()}")
-        else:
-            print("   ❌ Failed to retrieve DataFrame")
+    except Exception as e:
+        print(f"❌ Producer {process_id} error: {e}")
+
+
+def data_consumer_process(process_id: str, keys_to_watch: list, timeout: float = 30.0):
+    """
+    Simulates a data consumer process that retrieves and processes data.
+    """
+    print(f"🔍 Consumer {process_id} starting...")
+    
+    try:
+        # Initialize client
+        client = ArrowFlightClient(sender_id=f"consumer_{process_id}")
         
-        # Get server stats
-        print("\n📊 Server statistics:")
-        stats = client.get_server_stats()
-        print(f"   Stored tables: {stats.get('stored_tables', 'unknown')}")
-        print(f"   Max capacity: {stats.get('max_capacity', 'unknown')}")
+        for key in keys_to_watch:
+            print(f"   Waiting for data: {key}")
+            
+            # Wait for data to become available
+            if client.wait_for_table(key, timeout):
+                # Retrieve and process data
+                df = client.get_dataframe(key)
+                if df is not None:
+                    # Simple processing: calculate statistics
+                    stats = {
+                        'key': key,
+                        'rows': len(df),
+                        'mean_sensor_value': df['sensor_value'].mean() if 'sensor_value' in df.columns else None,
+                        'unique_sensors': df['sensor_id'].nunique() if 'sensor_id' in df.columns else None
+                    }
+                    
+                    print(f"🟢 Consumer {process_id} processed {key}: {stats}")
+                    
+                    # Optionally save processed results back to server
+                    result_key = f"processed_{key}_{process_id}"
+                    result_df = pd.DataFrame([stats])
+                    client.send_dataframe(
+                        result_key,
+                        result_df,
+                        f"Processed results by consumer {process_id}"
+                    )
+                else:
+                    print(f"🔴 Consumer {process_id} failed to retrieve {key}")
+            else:
+                print(f"⏰ Consumer {process_id} timeout waiting for {key}")
         
-        # Example of high-level data exchange
-        print("\n🔄 Testing high-level data exchange...")
-        exchange = ArrowFlightDataExchange()
+        print(f"✅ Consumer {process_id} completed")
         
-        # Publish data
-        sample_data = pd.DataFrame({
-            'x': np.random.randn(100),
-            'y': np.random.randn(100)
+    except Exception as e:
+        print(f"❌ Consumer {process_id} error: {e}")
+
+
+def live_monitor_process(monitor_id: str, channels: list = None, duration: float = 20.0, 
+                        poll_interval: float = 1.0):
+    """
+    Advanced monitoring process that watches multiple channels for live data.
+    """
+    if channels is None:
+        channels = ["live_feed"]
+    
+    print(f"📊 Monitor {monitor_id} starting...")
+    print(f"   Watching channels: {channels}")
+    print(f"   Duration: {duration}s, Poll interval: {poll_interval}s")
+    
+    try:
+        # Initialize data exchange
+        exchange = ArrowFlightDataExchange(process_id=f"monitor_{monitor_id}")
+        
+        start_time = time.time()
+        last_seen_data = {}  # Track last seen data per channel
+        monitoring_stats = {
+            'total_updates': 0,
+            'channels_seen': set(),
+            'producers_seen': set(),
+            'first_data_time': None,
+            'last_data_time': None
+        }
+        
+        print(f"🟢 Monitor {monitor_id} active - watching for data...")
+        
+        while time.time() - start_time < duration:
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+            
+            # Check each channel
+            for channel in channels:
+                try:
+                    # Get current data
+                    data = exchange.subscribe(channel, as_dataframe=True)
+                    
+                    if data is not None and len(data) > 0:
+                        # Create a unique identifier for this data
+                        data_signature = {
+                            'shape': data.shape,
+                            'columns': list(data.columns),
+                            'first_row_hash': hash(str(data.iloc[0].to_dict())) if len(data) > 0 else None,
+                            'last_row_hash': hash(str(data.iloc[-1].to_dict())) if len(data) > 0 else None
+                        }
+                        
+                        # Check if this is new data
+                        last_signature = last_seen_data.get(channel)
+                        is_new_data = (last_signature is None or 
+                                     last_signature != data_signature)
+                        
+                        if is_new_data:
+                            last_seen_data[channel] = data_signature
+                            monitoring_stats['total_updates'] += 1
+                            monitoring_stats['channels_seen'].add(channel)
+                            
+                            if monitoring_stats['first_data_time'] is None:
+                                monitoring_stats['first_data_time'] = current_time
+                            monitoring_stats['last_data_time'] = current_time
+                            
+                            # Extract metadata from data
+                            producer = 'unknown'
+                            latest_value = None
+                            data_timestamp = None
+                            
+                            if 'producer_id' in data.columns:
+                                producer = data['producer_id'].iloc[0]
+                                monitoring_stats['producers_seen'].add(producer)
+                            
+                            if 'sensor_value' in data.columns:
+                                latest_value = data['sensor_value'].iloc[-1]
+                            
+                            if 'timestamp' in data.columns:
+                                data_timestamp = data['timestamp'].iloc[-1]
+                            
+                            # Log the update
+                            print(f"🔴 [{elapsed_time:.1f}s] Monitor {monitor_id} - "
+                                  f"New data on '{channel}':")
+                            print(f"     Producer: {producer}")
+                            print(f"     Shape: {data.shape}")
+                            print(f"     Latest value: {latest_value}")
+                            if data_timestamp:
+                                print(f"     Data timestamp: {data_timestamp}")
+                            
+                            # Create detailed monitoring record
+                            monitoring_record = pd.DataFrame({
+                                'monitor_id': [monitor_id],
+                                'monitor_time': [current_time],
+                                'elapsed_time': [elapsed_time],
+                                'channel': [channel],
+                                'data_source': [producer],
+                                'data_shape_rows': [data.shape[0]],
+                                'data_shape_cols': [data.shape[1]],
+                                'latest_sensor_value': [latest_value],
+                                'data_timestamp': [str(data_timestamp) if data_timestamp else None],
+                                'columns': [','.join(data.columns)],
+                                'update_sequence': [monitoring_stats['total_updates']]
+                            })
+                            
+                            # Save monitoring results
+                            monitor_key = f"monitor_log_{monitor_id}_{monitoring_stats['total_updates']:03d}"
+                            exchange.publish(
+                                monitor_key,
+                                monitoring_record,
+                                f"Monitor {monitor_id} data update #{monitoring_stats['total_updates']}"
+                            )
+                            
+                            # Also save to a continuous log
+                            exchange.publish(
+                                f"monitor_continuous_log_{monitor_id}",
+                                monitoring_record,
+                                f"Continuous monitoring log from {monitor_id}"
+                            )
+                
+                except Exception as e:
+                    print(f"⚠️  Monitor {monitor_id} error checking channel '{channel}': {e}")
+            
+            # Periodic status update
+            if int(elapsed_time) % 5 == 0 and elapsed_time > 0:
+                print(f"📊 [{elapsed_time:.0f}s] Monitor {monitor_id} status: "
+                      f"{monitoring_stats['total_updates']} updates, "
+                      f"{len(monitoring_stats['channels_seen'])} channels active, "
+                      f"{len(monitoring_stats['producers_seen'])} producers seen")
+            
+            time.sleep(poll_interval)
+        
+        # Final summary
+        total_time = time.time() - start_time
+        print(f"\n✅ Monitor {monitor_id} completed after {total_time:.1f}s")
+        print(f"   📈 Summary:")
+        print(f"     Total data updates detected: {monitoring_stats['total_updates']}")
+        print(f"     Active channels: {list(monitoring_stats['channels_seen'])}")
+        print(f"     Producers seen: {list(monitoring_stats['producers_seen'])}")
+        
+        if monitoring_stats['first_data_time']:
+            data_active_time = monitoring_stats['last_data_time'] - monitoring_stats['first_data_time']
+            print(f"     Data activity period: {data_active_time:.1f}s")
+            print(f"     Average update rate: {monitoring_stats['total_updates']/data_active_time:.2f} updates/sec")
+        
+        # Save final summary
+        summary_data = pd.DataFrame({
+            'monitor_id': [monitor_id],
+            'total_runtime': [total_time],
+            'total_updates': [monitoring_stats['total_updates']],
+            'channels_monitored': [','.join(channels)],
+            'channels_active': [','.join(monitoring_stats['channels_seen'])],
+            'producers_seen': [','.join(monitoring_stats['producers_seen'])],
+            'completion_time': [time.time()]
         })
         
-        exchange.publish("test_channel", sample_data, "Test data for exchange")
+        exchange.publish(
+            f"monitor_summary_{monitor_id}",
+            summary_data,
+            f"Final monitoring summary from {monitor_id}"
+        )
+        
+    except Exception as e:
+        print(f"❌ Monitor {monitor_id} error: {e}")
+
+
+def aggregator_process(aggregator_id: str, wait_time: float = 15.0):
+    """
+    Simulates an aggregator process that collects data from multiple sources.
+    """
+    print(f"📈 Aggregator {aggregator_id} starting...")
+    
+    try:
+        # Initialize client
+        client = ArrowFlightClient(sender_id=f"aggregator_{aggregator_id}")
+        
+        # Wait for some data to accumulate
+        time.sleep(wait_time)
+        
+        # Get all available tables
+        tables = client.list_tables()
+        print(f"   Found {len(tables)} tables on server")
+        
+        # Collect all data that matches our pattern
+        all_data = []
+        for table_info in tables:
+            key = table_info['key']
+            if 'data_batch_' in key:  # Only process batch data
+                df = client.get_dataframe(key)
+                if df is not None:
+                    all_data.append(df)
+        
+        if all_data:
+            # Aggregate all data
+            combined_df = pd.concat(all_data, ignore_index=True)
+            
+            # Calculate aggregate statistics
+            aggregated_stats = pd.DataFrame({
+                'total_rows': [len(combined_df)],
+                'unique_producers': [combined_df['producer_id'].nunique()],
+                'mean_sensor_value': [combined_df['sensor_value'].mean()],
+                'std_sensor_value': [combined_df['sensor_value'].std()],
+                'min_sensor_value': [combined_df['sensor_value'].min()],
+                'max_sensor_value': [combined_df['sensor_value'].max()],
+                'aggregation_time': [time.time()]
+            })
+            
+            # Send aggregated results
+            success = client.send_dataframe(
+                f"aggregated_results_{aggregator_id}",
+                aggregated_stats,
+                f"Aggregated statistics by {aggregator_id}"
+            )
+            
+            if success:
+                print(f"🟢 Aggregator {aggregator_id} processed {len(all_data)} datasets")
+                print(f"   Total rows: {len(combined_df)}")
+                print(f"   Mean sensor value: {combined_df['sensor_value'].mean():.2f}")
+            else:
+                print(f"🔴 Aggregator {aggregator_id} failed to send results")
+        else:
+            print(f"⚠️  Aggregator {aggregator_id} found no data to process")
+        
+        print(f"✅ Aggregator {aggregator_id} completed")
+        
+    except Exception as e:
+        print(f"❌ Aggregator {aggregator_id} error: {e}")
+
+
+def run_multi_process_example():
+    """
+    Run a complete multi-process example demonstrating the relay server.
+    """
+    print("🚀 Starting Multi-Process ArrowFlight Relay Example")
+    print("=" * 60)
+    
+    # Test server connection first
+    try:
+        test_client = ArrowFlightClient()
+        print("✅ Server connection successful")
+    except Exception as e:
+        print(f"❌ Cannot connect to server: {e}")
+        print("   Make sure the C++ ArrowFlight server is running!")
+        return
+    
+    # Clear any existing data
+    test_client.clear_server()
+    print("🧹 Cleared existing data from server")
+    
+    processes = []
+    
+    try:
+        # Start producer processes
+        for i in range(2):
+            p = mp.Process(
+                target=data_producer_process,
+                args=(f"P{i}", 3, 2.0)  # 3 batches, 2 second delay
+            )
+            p.start()
+            processes.append(p)
+        
+        # Start monitor process
+        monitor_p = mp.Process(
+            target=live_monitor_process,
+            args=("M1", ["live_feed", "data_batch_P0_0"], 15.0, 1.0)  # Monitor multiple channels
+        )
+        monitor_p.start()
+        processes.append(monitor_p)
+        
+        # Start consumer processes (they will wait for specific data)
+        keys_to_consume = [
+            ["data_batch_P0_0", "data_batch_P0_1"],
+            ["data_batch_P1_0", "data_batch_P1_2"]
+        ]
+        
+        for i, keys in enumerate(keys_to_consume):
+            p = mp.Process(
+                target=data_consumer_process,
+                args=(f"C{i}", keys, 30.0)
+            )
+            p.start()
+            processes.append(p)
+        
+        # Start aggregator process
+        agg_p = mp.Process(
+            target=aggregator_process,
+            args=("A1", 10.0)  # Wait 10 seconds before aggregating
+        )
+        agg_p.start()
+        processes.append(agg_p)
+        
+        # Wait for all processes to complete
+        for p in processes:
+            p.join()
+        
+        print("\n📊 Final Server Statistics:")
+        print("=" * 40)
+        stats = test_client.get_server_stats()
+        print(f"Total stored tables: {stats.get('stored_tables', 'unknown')}")
+        
+        for table_info in stats.get('tables', []):
+            print(f"  • {table_info['key']}: {table_info['rows']} rows, "
+                  f"age {table_info['age_seconds']}s")
+        
+        print("\n🎉 Multi-process example completed successfully!")
+        
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+
+
+def run_advanced_monitoring_example():
+    """
+    Demonstrate advanced monitoring capabilities.
+    """
+    print("🔍 Starting Advanced Monitoring Example")
+    print("=" * 50)
+    
+    try:
+        # Test server connection
+        test_client = ArrowFlightClient()
+        print("✅ Server connection successful")
+        
+        # Clear existing data
+        test_client.clear_server()
+        print("🧹 Cleared existing data")
+        
+        processes = []
+        
+        # Start multiple producers with different patterns
+        producer_configs = [
+            ("FastProducer", 5, 0.5),    # 5 batches, 0.5s delay
+            ("SlowProducer", 3, 2.0),    # 3 batches, 2s delay
+            ("BurstProducer", 8, 0.2),   # 8 batches, 0.2s delay
+        ]
+        
+        for prod_id, batches, delay in producer_configs:
+            p = mp.Process(
+                target=data_producer_process,
+                args=(prod_id, batches, delay)
+            )
+            p.start()
+            processes.append(p)
+        
+        # Start advanced monitor watching multiple channels
+        monitor_channels = [
+            "live_feed",
+            "data_batch_FastProducer_0",
+            "data_batch_SlowProducer_0",
+            "data_batch_BurstProducer_0"
+        ]
+        
+        monitor_p = mp.Process(
+            target=live_monitor_process,
+            args=("AdvancedMonitor", monitor_channels, 12.0, 0.5)  # 12s duration, 0.5s poll
+        )
+        monitor_p.start()
+        processes.append(monitor_p)
+        
+        # Wait for all processes
+        for p in processes:
+            p.join()
+        
+        # Analyze monitoring results
+        print("\n📊 Analyzing monitoring results...")
+        time.sleep(1)  # Give time for final writes
+        
+        tables = test_client.list_tables()
+        monitor_tables = [t for t in tables if 'monitor' in t['key']]
+        
+        print(f"📋 Found {len(monitor_tables)} monitoring result tables:")
+        for table in monitor_tables:
+            print(f"   • {table['key']}: {table['total_records']} records")
+        
+        # Get and display summary
+        summary_data = test_client.get_dataframe("monitor_summary_AdvancedMonitor")
+        if summary_data is not None:
+            print(f"\n📈 Monitor Summary:")
+            print(f"   Runtime: {summary_data['total_runtime'].iloc[0]:.1f}s")
+            print(f"   Updates detected: {summary_data['total_updates'].iloc[0]}")
+            print(f"   Channels monitored: {summary_data['channels_monitored'].iloc[0]}")
+            print(f"   Active channels: {summary_data['channels_active'].iloc[0]}")
+            print(f"   Producers seen: {summary_data['producers_seen'].iloc[0]}")
+        
+        print("\n🎉 Advanced monitoring example completed!")
+        
+    except Exception as e:
+        print(f"❌ Error in advanced monitoring example: {e}")
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+
+
+def run_simple_example():
+    """
+    Run a simple single-process example.
+    """
+    print("🚀 Starting Simple ArrowFlight Example")
+    print("=" * 40)
+    
+    try:
+        # Initialize data exchange
+        exchange = ArrowFlightDataExchange(process_id="simple_example")
+        
+        # Create sample data
+        sample_data = pd.DataFrame({
+            'id': range(100),
+            'value': np.random.randn(100),
+            'category': np.random.choice(['A', 'B', 'C'], 100)
+        })
+        
+        # Publish data
+        print("📤 Publishing sample data...")
+        success = exchange.publish("simple_channel", sample_data, "Simple example data")
+        print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
         
         # Subscribe to data
-        received_data = exchange.subscribe("test_channel")
-        if received_data is not None:
-            print(f"   ✅ Data exchange successful: {len(received_data)} rows")
-        else:
-            print("   ❌ Data exchange failed")
+        print("📥 Subscribing to data...")
+        retrieved_data = exchange.subscribe("simple_channel")
         
-        print("\n🎉 All tests completed!")
+        if retrieved_data is not None:
+            print(f"   ✅ Retrieved {len(retrieved_data)} rows")
+            print(f"   Sample: {retrieved_data.head()}")
+        else:
+            print("   ❌ Failed to retrieve data")
+        
+        # List channels
+        channels = exchange.list_channels()
+        print(f"📋 Available channels: {channels}")
+        
+        # Get server status
+        status = exchange.get_server_status()
+        print(f"📊 Server has {status.get('stored_tables', 0)} stored tables")
+        
+        print("🎉 Simple example completed!")
         
     except Exception as e:
         print(f"❌ Error: {e}")
+    """
+    Run a simple single-process example.
+    """
+    print("🚀 Starting Simple ArrowFlight Example")
+    print("=" * 40)
+    
+    try:
+        # Initialize data exchange
+        exchange = ArrowFlightDataExchange(process_id="simple_example")
+        
+        # Create sample data
+        sample_data = pd.DataFrame({
+            'id': range(100),
+            'value': np.random.randn(100),
+            'category': np.random.choice(['A', 'B', 'C'], 100)
+        })
+        
+        # Publish data
+        print("📤 Publishing sample data...")
+        success = exchange.publish("simple_channel", sample_data, "Simple example data")
+        print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
+        
+        # Subscribe to data
+        print("📥 Subscribing to data...")
+        retrieved_data = exchange.subscribe("simple_channel")
+        
+        if retrieved_data is not None:
+            print(f"   ✅ Retrieved {len(retrieved_data)} rows")
+            print(f"   Sample: {retrieved_data.head()}")
+        else:
+            print("   ❌ Failed to retrieve data")
+        
+        # List channels
+        channels = exchange.list_channels()
+        print(f"📋 Available channels: {channels}")
+        
+        # Get server status
+        status = exchange.get_server_status()
+        print(f"📊 Server has {status.get('stored_tables', 0)} stored tables")
+        
+        print("🎉 Simple example completed!")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+
+def main():
+    """
+    Main function with command line argument parsing.
+    """
+    parser = argparse.ArgumentParser(description="ArrowFlight Relay Examples")
+    parser.add_argument(
+        "--mode",
+        choices=["simple", "multi", "advanced-monitor", "producer", "consumer", "monitor", "aggregator"],
+        default="simple",
+        help="Example mode to run"
+    )
+    parser.add_argument("--id", default="1", help="Process ID")
+    parser.add_argument("--keys", nargs="*", help="Keys to watch (for consumer)")
+    parser.add_argument("--channels", nargs="*", help="Channels to monitor (for monitor mode)")
+    parser.add_argument("--channel", default="live_feed", help="Single channel to monitor (deprecated, use --channels)")
+    parser.add_argument("--duration", type=float, default=20.0, help="Duration to run")
+    parser.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for monitor")
+    
+    args = parser.parse_args()
+    
+    if args.mode == "simple":
+        run_simple_example()
+    elif args.mode == "multi":
+        run_multi_process_example()
+    elif args.mode == "advanced-monitor":
+        run_advanced_monitoring_example()
+    elif args.mode == "producer":
+        data_producer_process(args.id)
+    elif args.mode == "consumer":
+        keys = args.keys or [f"data_batch_{args.id}_0"]
+        data_consumer_process(args.id, keys)
+    elif args.mode == "monitor":
+        channels = args.channels or [args.channel]  # Use new channels parameter or fall back to single channel
+        live_monitor_process(args.id, channels, args.duration, args.poll_interval)
+    elif args.mode == "aggregator":
+        aggregator_process(args.id)
+    else:
+        print(f"Unknown mode: {args.mode}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
