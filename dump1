@@ -637,3 +637,505 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+// ArrowTableAPI.h
+#pragma once
+
+#include <arrow/api.h>
+#include <arrow/flight/api.h>
+#include <arrow/result.h>
+#include <arrow/table.h>
+#include <arrow/io/memory.h>
+#include <arrow/ipc/api.h>
+#include <arrow/ipc/options.h>
+#include <arrow/record_batch.h>
+#include <arrow/record_batch_reader.h>
+#include <arrow/compute/api.h>
+#include <arrow/compute/exec.h>
+#include <arrow/compute/kernels/compare.h>
+#include <arrow/compute/kernels/unique.h>
+#include <variant>
+#include <memory>
+#include <concepts>
+#include <queue>
+#include <deque>
+#include <unordered_set>
+#include <unordered_map>
+#include <optional>
+#include <functional>
+#include <type_traits>
+#include <iostream>
+#include <Windows.h>
+#include <comutil.h>
+#include <guiddef.h>
+#include <oaidl.h>
+#include <oleauto.h>
+#include <esriCore.h>
+#pragma comment(lib, "comsuppw.lib")
+
+// Concept: Requires that a Transformer can transform to/from arrow::Array or arrow::Scalar
+template <typename T, typename ArrowT>
+concept ArrowTransformer = requires(T t, ArrowT arrow_val) {
+    { t.to_arrow(arrow_val) } -> std::same_as<arrow::Result<std::shared_ptr<arrow::Scalar>>>;
+    { t.from_arrow(arrow_val) } -> std::same_as<arrow::Result<T>>;
+};
+
+// BasicVariant transformer for primitive Arrow types
+struct BasicVariant {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT& val) const {
+        switch (val.vt) {
+            case VT_I4:
+                return arrow::MakeScalar(static_cast<int32_t>(val.lVal));
+            case VT_I8:
+                return arrow::MakeScalar(static_cast<int64_t>(val.llVal));
+            case VT_R8:
+                return arrow::MakeScalar(val.dblVal);
+            case VT_BSTR:
+                return arrow::MakeScalar(std::string(_bstr_t(val.bstrVal)));
+            default:
+                return arrow::Status::NotImplemented("Unsupported VARIANT type in BasicVariant");
+        }
+    }
+
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>& scalar) const {
+        VARIANT var;
+        VariantInit(&var);
+        if (scalar->type->id() == arrow::Type::INT32) {
+            var.vt = VT_I4;
+            var.lVal = static_cast<int32_t>(std::static_pointer_cast<arrow::Int32Scalar>(scalar)->value);
+        } else if (scalar->type->id() == arrow::Type::INT64) {
+            var.vt = VT_I8;
+            var.llVal = std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value;
+        } else if (scalar->type->id() == arrow::Type::DOUBLE) {
+            var.vt = VT_R8;
+            var.dblVal = std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value;
+        } else if (scalar->type->id() == arrow::Type::STRING) {
+            auto str = std::static_pointer_cast<arrow::StringScalar>(scalar)->ToString();
+            var.vt = VT_BSTR;
+            var.bstrVal = SysAllocString(std::wstring(str.begin(), str.end()).c_str());
+        } else {
+            return arrow::Status::NotImplemented("Unsupported Arrow type in BasicVariant");
+        }
+        return var;
+    }
+};
+
+// Transformers for ESRI types
+struct GeometryTransform {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
+        return arrow::Status::NotImplemented("GeometryTransform::to_arrow not implemented");
+    }
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
+        return arrow::Status::NotImplemented("GeometryTransform::from_arrow not implemented");
+    }
+};
+
+struct IvariantTransform {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT& val) const {
+        // TODO: Convert VARIANT to Arrow
+        return arrow::Status::NotImplemented("IvariantTransform::to_arrow not implemented");
+    }
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>& scalar) const {
+        VARIANT var;
+        VariantInit(&var);
+        if (auto int_scalar = std::dynamic_pointer_cast<arrow::Int64Scalar>(scalar)) {
+            var.vt = VT_I8;
+            var.llVal = int_scalar->value;
+        } else if (auto str_scalar = std::dynamic_pointer_cast<arrow::StringScalar>(scalar)) {
+            var.vt = VT_BSTR;
+            var.bstrVal = ::SysAllocString(std::wstring(str_scalar->ToString().begin(), str_scalar->ToString().end()).c_str());
+        } else {
+            return arrow::Status::NotImplemented("Unsupported VARIANT conversion");
+        }
+        return var;
+    }
+};
+
+struct GuidTransform {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
+        return arrow::Status::NotImplemented("GuidTransform::to_arrow not implemented");
+    }
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
+        return arrow::Status::NotImplemented("GuidTransform::from_arrow not implemented");
+    }
+};
+
+struct RasterTransform {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
+        return arrow::Status::NotImplemented("RasterTransform::to_arrow not implemented");
+    }
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
+        return arrow::Status::NotImplemented("RasterTransform::from_arrow not implemented");
+    }
+};
+
+// Compose multiple transformers using inheritance-like layering
+template <typename Base, typename Derived>
+struct TransformerChain : public Base, public Derived {
+    using Base::to_arrow;
+    using Base::from_arrow;
+    using Derived::to_arrow;
+    using Derived::from_arrow;
+};
+
+struct DefaultTransformer {
+    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
+        return arrow::Status::NotImplemented("DefaultTransformer::to_arrow not implemented");
+    }
+    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
+        return arrow::Status::NotImplemented("DefaultTransformer::from_arrow not implemented");
+    }
+};
+
+class ArrowTableAPI {
+public:
+    using TransformerFactory = std::function<std::unique_ptr<DefaultTransformer>()>;
+
+    static void RegisterTransformer(const std::string& esri_type, TransformerFactory factory) {
+        GetRegistry()[esri_type] = std::move(factory);
+    }
+
+private:
+    static std::unordered_map<std::string, TransformerFactory>& GetRegistry() {
+        static std::unordered_map<std::string, TransformerFactory> registry;
+        return registry;
+    }
+
+public:
+public:
+    // Support for pipeline-style filters and transforms
+
+// Type-based conditional transform pipe
+template <arrow::Type::type ArrowTypeID, typename Transformer>
+struct ForArrowType {
+    auto operator()(auto&& builder) const {
+        return std::forward<decltype(builder)>(builder)
+            .conditionalTransform<Transformer>(
+                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
+                    return field->type()->id() == ArrowTypeID;
+                });
+    }
+};
+
+template <arrow::Type::type ArrowTypeID, typename Transformer>
+ForArrowType<ArrowTypeID, Transformer> forType() {
+    return {};
+}
+
+// Metadata-based conditional transform pipe
+
+// Match a single esri_type
+template <const char* TargetType, typename Transformer>
+struct ForEsriType {
+    auto operator()(auto&& builder) const {
+        return std::forward<decltype(builder)>(builder)
+            .conditionalTransform<Transformer>(
+                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
+                    std::string type;
+                    auto meta = field->metadata();
+                    return meta && meta->Get("esri_type", &type) && type == TargetType;
+                });
+    }
+};
+
+// Match multiple esri_types
+template <typename Transformer, const char*... EsriTypes>
+struct ForEsriTypes {
+    auto operator()(auto&& builder) const {
+        return std::forward<decltype(builder)>(builder)
+            .conditionalTransform<Transformer>(
+                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
+                    std::string type;
+                    auto meta = field->metadata();
+                    if (!meta || !meta->Get("esri_type", &type)) return false;
+                    return ((type == EsriTypes) || ...);
+                });
+    }
+};                });
+    }
+};
+
+#define DEFINE_ESRI_TYPE_KEY(name) constexpr char name[] = #name;
+DEFINE_ESRI_TYPE_KEY(geometry)
+DEFINE_ESRI_TYPE_KEY(raster)
+DEFINE_ESRI_TYPE_KEY(guid)
+DEFINE_ESRI_TYPE_KEY(variant)
+
+#undef DEFINE_ESRI_TYPE_KEY
+    template <typename BuilderT, typename FilterT>
+    friend BuilderT operator|(BuilderT&& builder, FilterT&& filter) {
+            if constexpr (std::is_invocable_v<FilterT, BuilderT>) {
+                return filter(std::forward<BuilderT>(builder));
+            } else {
+                return std::forward<BuilderT>(builder).transform<std::decay_t<FilterT>>();
+            }
+        }
+
+        friend auto operator|(Builder&& builder, std::invocable<Builder> auto&& filter) {
+            return filter(std::move(builder));
+        }
+
+
+        return std::forward<BuilderT>(builder).transform<std::decay_t<FilterT>>();
+    }
+
+    template <typename Transformer_ = DefaultTransformer>
+    class Builder {
+    public:
+        Builder(std::shared_ptr<arrow::Table> table) : table_(std::move(table)) {}
+        Builder(std::shared_ptr<arrow::Table> table, std::shared_ptr<arrow::RecordBatchReader> reader) : table_(std::move(table)), reader_(std::move(reader)) {}
+
+        template <typename NewTransformer, typename... Args>
+        auto transform(Args&&... args) && {
+            using Next = TransformerChain<Transformer_, NewTransformer>;
+            Builder<Next> next_builder(reader_ ? nullptr : table_, reader_);
+            next_builder.set_transformer(Next(std::forward<Args>(args)...));
+            return std::move(next_builder);
+        }
+
+        template <typename NewTransformer>
+        auto conditionalTransform(
+            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
+            std::function<void()> fallback = nullptr
+        ) && {
+            bool apply = false;
+            if (table_) {
+                auto schema = table_->schema();
+                for (const auto& field : schema->fields()) {
+                    if (should_apply(schema, field)) {
+                        apply = true;
+                        break;
+                    }
+                }
+            }
+            if (apply) {
+                return std::move(*this).transform<NewTransformer>();
+            } else if (fallback) {
+                fallback();
+            }
+            return std::move(*this);
+        }
+
+        template <typename... Chains>
+        auto conditionalTransformChainAll(Chains&&... chains) && {
+            int step = 0;
+            ((std::wcout << L"[Chain " << step++ << L"] applying conditional transform...
+"),
+              std::move(*this).conditionalTransformChain(std::forward<Chains>(chains)))...
+        }
+        }
+
+        template <typename... Transforms>
+        auto conditionalTransformChain(
+            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
+            std::function<void()> fallback = nullptr
+        ) && {
+            return conditionalTransformChainImpl<Transforms...>(should_apply, fallback);
+        }
+
+        template <typename... Transforms>
+        auto conditionalTransformByFieldName(const std::vector<std::string>& names, std::function<void()> fallback = nullptr) && {
+            return conditionalTransformChainImpl<Transforms...>(
+                [=](const auto&, const std::shared_ptr<arrow::Field>& field) {
+                    return std::find(names.begin(), names.end(), field->name()) != names.end();
+                },
+                fallback);
+        }
+
+        template <typename... Transforms>
+        auto conditionalTransformByFieldName(const std::string& name, std::function<void()> fallback = nullptr) && {
+            return conditionalTransformChainImpl<Transforms...>(
+                [=](const auto&, const std::shared_ptr<arrow::Field>& field) {
+                    return field->name() == name;
+                },
+                fallback);
+        }
+
+        template <typename... Transforms>
+        auto conditionalTransformByIndex(const std::vector<int>& indices, std::function<void()> fallback = nullptr) && {
+            return conditionalTransformChainImpl<Transforms...>(
+                [=](const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<arrow::Field>& field) {
+                    for (int index : indices) {
+                        if (index >= 0 && index < schema->num_fields() && schema->field(index) == field)
+                            return true;
+                    }
+                    return false;
+                },
+                fallback);
+        }
+
+        template <typename... Transforms>
+        auto conditionalTransformByIndex(int index, std::function<void()> fallback = nullptr) && {
+            return conditionalTransformChainImpl<Transforms...>(
+                [=](const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<arrow::Field>& field) {
+                    return index >= 0 && index < schema->num_fields() && schema->field(index) == field;
+                },
+                fallback);
+        }
+
+    private:
+        template <typename... Transforms>
+        auto conditionalTransformChainImpl(
+            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
+            std::function<void()> fallback = nullptr
+        ) && {
+            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
+            std::function<void()> fallback = nullptr
+        ) && {
+            bool applied = false;
+            if (table_) {
+                auto schema = table_->schema();
+                for (const auto& field : schema->fields()) {
+                    if (should_apply(schema, field)) {
+                        applied = true;
+                        break;
+                    }
+                }
+            }
+            if constexpr (sizeof...(Transforms) > 0) {
+                if (applied) {
+                    return (std::move(*this).transform<Transforms>() , ...);
+                } else if (fallback) {
+                    fallback();
+                }
+            }
+            return std::move(*this);
+        }
+            using Next = TransformerChain<Transformer_, NewTransformer>;
+            Builder<Next> next_builder(reader_ ? nullptr : table_, reader_);
+            next_builder.set_transformer(Next(std::forward<Args>(args)...));
+            return std::move(next_builder);
+        }
+
+        Builder&& autoTransformFromMetadata() && {
+            if (table_) {
+                for (int i = 0; i < table_->num_columns(); ++i) {
+                    const auto& field = table_->field(i);
+                    const auto& meta = field->metadata();
+                    if (!meta) continue;
+                    std::string type;
+                    if (meta->Get("esri_type", &type)) {
+    std::cout << "Auto-transforming column " << field->name() << " with type " << type << std::endl;
+    auto& registry = GetRegistry();
+    if (auto it = registry.find(type); it != registry.end()) {
+        auto transformer_ptr = it->second();
+        *this = std::move(*this).transform<std::decay_t<decltype(*transformer_ptr)>>();
+    } else if (type == "variant") {
+                            *this = std::move(*this).transform<IvariantTransform>();
+                        } else if (type == "guid") {
+                            *this = std::move(*this).transform<GuidTransform>();
+                        } else if (type == "raster") {
+                            *this = std::move(*this).transform<RasterTransform>();
+                        }
+                    }
+                }
+            }
+            return std::move(*this);
+        }
+
+        template <typename FinalTransformer>
+        class Wrapper {
+        public:
+            Wrapper(std::shared_ptr<arrow::Table> table, std::shared_ptr<arrow::RecordBatchReader> reader, FinalTransformer transformer)
+                : table_(std::move(table)), reader_(std::move(reader)), transformer_(std::move(transformer)) {
+                if (table_) {
+                    arrow::TableBatchReader table_reader(*table_);
+                    reader_ = std::make_shared<arrow::TableBatchReader>(std::move(table_reader));
+                }
+                ARROW_ASSIGN_OR_RAISE(current_batch_, reader_->Next());
+            }
+
+            arrow::Result<std::vector<VARIANT>> NextRow() {
+                while (current_batch_ && row_index_ >= current_batch_->num_rows()) {
+                    ARROW_ASSIGN_OR_RAISE(current_batch_, reader_->Next());
+                    row_index_ = 0;
+                    if (!current_batch_) return arrow::Status::IndexError("No more rows");
+                }
+
+                std::vector<VARIANT> result;
+                std::cout << "Row " << row_index_ << ": ";
+                for (int i = 0; i < current_batch_->num_columns(); ++i) {
+                    ARROW_ASSIGN_OR_RAISE(auto scalar, current_batch_->column(i)->GetScalar(row_index_));
+                    ARROW_ASSIGN_OR_RAISE(auto val, transformer_.from_arrow(scalar));
+                    result.push_back(val);
+                    _bstr_t bs(val);
+                    std::wcout << static_cast<wchar_t*>(bs) << L" ";
+                }
+                std::wcout << std::endl;
+                ++row_index_;
+                return result;
+            }
+
+        private:
+            std::shared_ptr<arrow::Table> table_;
+            std::shared_ptr<arrow::RecordBatchReader> reader_;
+            std::shared_ptr<arrow::RecordBatch> current_batch_;
+            FinalTransformer transformer_;
+            int64_t row_index_ = 0;
+        };
+
+        auto rowIterator() && {
+            return Wrapper<Transformer_>(table_, reader_, transformer_);
+        }
+
+        // Converts a single row of VARIANTs into Arrow Scalars using the composed transformer
+        arrow::Result<std::vector<std::shared_ptr<arrow::Scalar>>> ToArrowScalars(const std::vector<VARIANT>& input) {
+            std::vector<std::shared_ptr<arrow::Scalar>> scalars;
+            for (const auto& var : input) {
+                ARROW_ASSIGN_OR_RAISE(auto scalar, transformer_.to_arrow(var));
+                scalars.push_back(std::move(scalar));
+            }
+            return scalars;
+        }
+
+        // Helper to create a record batch from a vector of rows
+        arrow::Result<std::shared_ptr<arrow::RecordBatch>> ToRecordBatch(
+            const std::vector<std::vector<VARIANT>>& rows,
+            const std::shared_ptr<arrow::Schema>& schema) {
+            std::vector<std::vector<std::shared_ptr<arrow::Scalar>>> all_scalars;
+            for (const auto& row : rows) {
+                ARROW_ASSIGN_OR_RAISE(auto scalars, ToArrowScalars(row));
+                all_scalars.push_back(std::move(scalars));
+            }
+
+            std::vector<std::shared_ptr<arrow::Array>> columns;
+            for (size_t col = 0; col < schema->num_fields(); ++col) {
+                std::vector<std::shared_ptr<arrow::Scalar>> col_scalars;
+                for (const auto& row : all_scalars) col_scalars.push_back(row[col]);
+
+                ARROW_ASSIGN_OR_RAISE(auto arr, arrow::MakeArrayFromScalars(
+                    col_scalars, schema->field(static_cast<int>(col))->type(), arrow::default_memory_pool()));
+                columns.push_back(arr);
+            }
+
+            return arrow::RecordBatch::Make(schema, static_cast<int>(rows.size()), columns);
+        }
+            return Wrapper<Transformer_>(table_, reader_, transformer_);
+        }
+
+    private:
+        std::shared_ptr<arrow::Table> table_;
+        std::shared_ptr<arrow::RecordBatchReader> reader_;
+
+        template <typename T>
+        friend class Builder;
+
+        template <typename T>
+        void set_transformer(T transformer) {
+            transformer_ = std::move(transformer);
+        }
+
+        Transformer_ transformer_;
+    };
+
+    static Builder<> builder(std::shared_ptr<arrow::Table> table) {
+        return Builder<>(std::move(table));
+    }
+
+    static Builder<> builder(std::shared_ptr<arrow::RecordBatchReader> reader) {
+        return Builder<>(nullptr, std::move(reader));
+    }
+};
+
