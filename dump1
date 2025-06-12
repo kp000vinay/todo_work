@@ -1139,3 +1139,35 @@ DEFINE_ESRI_TYPE_KEY(variant)
     }
 };
 
+#include "ArrowTableAPI.h"
+#include <arrow/flight/api.h>
+
+arrow::Result<std::shared_ptr<arrow::Table>> FetchTableFromFlight(const std::string& host, int port) {
+    arrow::flight::Location location;
+    ARROW_ASSIGN_OR_RAISE(location, arrow::flight::Location::Parse("grpc://" + host + ":" + std::to_string(port)));
+    std::unique_ptr<arrow::flight::FlightClient> client;
+    ARROW_RETURN_NOT_OK(arrow::flight::FlightClient::Connect(location, &client));
+
+    auto descriptor = arrow::flight::FlightDescriptor::Path({"default"});
+    ARROW_ASSIGN_OR_RAISE(auto info, client->GetFlightInfo(descriptor));
+    ARROW_ASSIGN_OR_RAISE(auto stream, client->DoGet(info.endpoints()[0].ticket));
+
+    ARROW_ASSIGN_OR_RAISE(auto reader, stream->ToRecordBatchReader());
+    ARROW_ASSIGN_OR_RAISE(auto table, reader->ToTable());
+    return table;
+}
+
+// Then use like:
+auto maybe_table = FetchTableFromFlight("localhost", 8815);
+if (maybe_table.ok()) {
+    auto table = maybe_table.ValueOrDie();
+    auto iter = ArrowTableAPI::builder(table)
+        | forType<arrow::Type::INT32, BasicVariant>()
+        .rowIterator();
+
+    while (auto row = iter.NextRow()) {
+        // already prints each row with wcout
+    }
+} else {
+    std::cerr << "Failed to fetch table: " << maybe_table.status().ToString() << std::endl;
+}
