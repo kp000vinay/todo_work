@@ -314,3 +314,278 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+// === ArrowTableIterator.hpp ===
+#pragma once
+
+#include <arrow/api.h>
+#include <arrow/record_batch.h>
+#include <arrow/flight/api.h>
+#include <vector>
+#include <memory>
+#include <tuple>
+#include <string>
+#include <type_traits>
+
+// ---- Transformer Framework ----
+// CRTP base: Derived must define 'using arrow_c_type' and forward_impl/backward_impl
+// ArrowType: Arrow type class; UserType: desired user-facing type; Derived: CRTP
+template<typename ArrowType, typename UserType, typename Derived>
+struct Transformer {
+    using arrow_type = ArrowType;
+    using c_type = typename Derived::arrow_c_type;
+    // Forward: Arrow c_type -> UserType
+    static constexpr UserType forward(c_type v) {
+        return Derived::forward_impl(v);
+    }
+    // Backward: UserType -> Arrow c_type
+    static constexpr c_type backward(UserType v) {
+        return Derived::backward_impl(v);
+    }
+};
+
+// ---- Identity Transformers ----
+template<typename Dummy = void>
+struct IdentityInt32 : Transformer<arrow::Int32Type, int32_t, IdentityInt32<>> {
+    using arrow_c_type = int32_t;
+    static constexpr int32_t forward_impl(int32_t v) { return v; }
+    static constexpr int32_t backward_impl(int32_t v) { return v; }
+};
+
+template<typename Dummy = void>
+struct IdentityDouble : Transformer<arrow::DoubleType, double, IdentityDouble<>> {
+    using arrow_c_type = double;
+    static constexpr double forward_impl(double v) { return v; }
+    static constexpr double backward_impl(double v) { return v; }
+};
+
+template<typename Dummy = void>
+struct IdentityBoolean : Transformer<arrow::BooleanType, bool, IdentityBoolean<>> {
+    using arrow_c_type = bool;
+    static constexpr bool forward_impl(bool v) { return v; }
+    static constexpr bool backward_impl(bool v) { return v; }
+};
+
+template<typename Dummy = void>
+struct IdentityString : Transformer<arrow::StringType, std::string, IdentityString<>> {
+    using arrow_c_type = std::string;
+    static std::string forward_impl(const std::string& v) { return v; }
+    static std::string backward_impl(const std::string& v) { return v; }
+};
+
+// ReceiveAll transformer: catches any arrow::Scalar as user type
+struct ReceiveAllTransformer {
+    using arrow_c_type = std::shared_ptr<arrow::Scalar>;
+    using UserType = std::shared_ptr<arrow::Scalar>;
+    static std::shared_ptr<arrow::Scalar> forward_impl(std::shared_ptr<arrow::Scalar> v) { return v; }
+    static std::shared_ptr<arrow::Scalar> backward_impl(std::shared_ptr<arrow::Scalar> v) { return v; }
+};
+
+// ---- Transformer List with currying ----
+template<typename... Ts>
+struct TransformerList {
+    template<typename New>
+    using append = TransformerList<Ts..., New>;
+};
+
+template<typename List, size_t N>
+struct TransformerAt;
+
+template<typename Head, typename... Tail>
+struct TransformerAt<TransformerList<Head, Tail...>, 0> { using type = Head; };
+
+template<typename Head, typename... Tail, size_t N>
+struct TransformerAt<TransformerList<Head, Tail...>, N> : TransformerAt<TransformerList<Tail...>, N-1> {};
+
+// ---- Metadata Checker ----
+template<typename SchemaMetadataKey, typename SchemaMetadataValue>
+struct MetadataFilter {
+    static bool check(const std::shared_ptr<arrow::Schema>& schema,
+                      std::shared_ptr<arrow::RecordBatch>, int64_t) {
+        auto md = schema->metadata();
+        return md && md->Get(SchemaMetadataKey::value).ValueOr("") == SchemaMetadataValue::value;
+    }
+};
+
+struct AllowAll {
+    static bool check(const std::shared_ptr<arrow::Schema>&,
+                      std::shared_ptr<arrow::RecordBatch>, int64_t) {
+        return true;
+    }
+};
+
+// ---- Streamed Backend ----
+class StreamedBackend {
+public:
+    explicit StreamedBackend(std::unique_ptr<arrow::flight::FlightStreamReader> reader)
+        : reader_(std::move(reader)) {}
+
+    std::shared_ptr<arrow::RecordBatch> next_batch() {
+        auto res = reader_->Next();
+        if (res.ok() && res.ValueUnsafe()) return res.ValueUnsafe();
+        return nullptr;
+    }
+    std::shared_ptr<arrow::Schema> schema() const { return reader_->schema(); }
+private:
+    std::unique_ptr<arrow::flight::FlightStreamReader> reader_;
+};
+
+// ---- Row Proxy ----
+template<typename Transformers>
+class RowProxy {
+public:
+    RowProxy(std::shared_ptr<arrow::RecordBatch> batch, int64_t row)
+        : batch_(batch), row_(row) {}
+
+    // Access column I
+    template<size_t I>
+    auto get() const {
+        using TransformerT = typename TransformerAt<Transformers, I>::type;
+        using ArrowType = typename TransformerT::arrow_type;
+        using CType    = typename TransformerT::c_type;
+
+        auto col = batch_->column(I);
+        if constexpr (std::is_same_v<ArrowType, arrow::StringType>) {
+            auto arr = std::static_pointer_cast<arrow::StringArray>(col);
+            auto raw = arr->GetString(row_);
+            return TransformerT::forward(raw);
+        } else {
+            using ArrayType = typename arrow::TypeTraits<ArrowType>::ArrayType;
+            auto arr = std::static_pointer_cast<ArrayType>(col);
+            auto raw = arr->Value(row_);
+            return TransformerT::forward(raw);
+        }
+    }
+
+    // Catch-all: extra scalars
+    std::vector<std::shared_ptr<arrow::Scalar>> receive_all() const {
+        std::vector<std::shared_ptr<arrow::Scalar>> extras;
+        size_t ncol = batch_->num_columns();
+        constexpr size_t Tcols = std::tuple_size<Transformers>::value;
+        for (size_t i = Tcols; i < ncol; ++i) {
+            auto res = batch_->column(i)->GetScalar(row_);
+            if (res.ok()) extras.push_back(res.ValueUnsafe());
+        }
+        return extras;
+    }
+private:
+    std::shared_ptr<arrow::RecordBatch> batch_;
+    int64_t row_;
+};
+
+// ---- Iterator ----
+template<typename Backend, typename Transformers,
+         typename MetaChecker = AllowAll>
+class RowIterator {
+public:
+    using value_type = RowProxy<Transformers>;
+    RowIterator(std::shared_ptr<Backend> backend, bool end = false)
+        : backend_(backend) {
+        if (!end) { advance_batch(); advance_row(); }
+        row_idx_ = end ? -1 : row_idx_;
+    }
+    bool operator!=(RowIterator const& other) const {
+        return row_idx_ != other.row_idx_ || batch_.get() != other.batch_.get();
+    }
+    RowIterator& operator++() { advance_row(); return *this; }
+    value_type operator*() const { return {batch_, row_idx_}; }
+private:
+    void advance_batch() { batch_ = backend_->next_batch(); row_idx_ = 0; }
+    void advance_row() {
+        while (batch_) {
+            if (row_idx_ < batch_->num_rows() && MetaChecker::check(batch_->schema(), batch_, row_idx_))
+                return;
+            if (++row_idx_ >= batch_->num_rows()) advance_batch();
+        }
+        row_idx_ = -1;
+    }
+    std::shared_ptr<Backend> backend_;
+    std::shared_ptr<arrow::RecordBatch> batch_;
+    int64_t row_idx_;
+};
+
+// ---- Table View ----
+template<typename Backend, typename Transformers,
+         typename MetaChecker = AllowAll>
+class TableView {
+public:
+    explicit TableView(std::shared_ptr<Backend> backend) : backend_(backend) {}
+    auto begin() { return RowIterator<Backend, Transformers, MetaChecker>(backend_, false); }
+    auto end()   { return RowIterator<Backend, Transformers, MetaChecker>(backend_, true); }
+    template<typename New>
+    auto addTransformer() const {
+        using NewList = typename Transformers::template append<New>;
+        return TableView<Backend, NewList, MetaChecker>(backend_);
+    }
+private:
+    std::shared_ptr<Backend> backend_;
+};
+
+
+// === flight_double_roundtrip_client.cpp ===
+#include "ArrowTableIterator.hpp"
+#include <arrow/api.h>
+#include <arrow/flight/api.h>
+#include <arrow/record_batch.h>
+#include <arrow/table.h>
+#include <iostream>
+
+struct ProcessTrueKey { static constexpr const char* value = "process"; };
+struct ProcessTrueVal { static constexpr const char* value = "true"; };
+
+int main() {
+    auto loc = arrow::flight::Location::ForGrpcTcp("localhost", 8815).ValueOrDie();
+    auto client = arrow::flight::FlightClient::Connect(loc).ValueOrDie();
+    arrow::flight::FlightDescriptor descr = arrow::flight::FlightDescriptor::Command("my_table");
+
+    arrow::KeyValueMetadata metadata; metadata.Append("process", "true");
+    auto schema = arrow::schema({
+        arrow::field("i32", arrow::int32()),
+        arrow::field("f64", arrow::float64()),
+        arrow::field("bol", arrow::boolean()),
+        arrow::field("str", arrow::utf8())
+    }, std::make_shared<arrow::KeyValueMetadata>(metadata));
+
+    arrow::Int32Builder b1; b1.AppendValues({1,2,3}); std::shared_ptr<arrow::Array> a1; b1.Finish(&a1);
+    arrow::DoubleBuilder b2; b2.AppendValues({0.1,0.2,0.3}); std::shared_ptr<arrow::Array> a2; b2.Finish(&a2);
+    arrow::BooleanBuilder b3; b3.AppendValues({true,false,true}); std::shared_ptr<arrow::Array> a3; b3.Finish(&a3);
+    arrow::StringBuilder b4; b4.AppendValues({"a","b","c"}); std::shared_ptr<arrow::Array> a4; b4.Finish(&a4);
+    auto table1 = arrow::Table::Make(schema, {a1,a2,a3,a4});
+
+    auto do_put = [&](std::shared_ptr<arrow::Table> tbl) {
+        auto [writer, _] = client->DoPut(descr, tbl->schema());
+        arrow::TableBatchReader rdr(*tbl); rdr.set_chunksize(2);
+        std::shared_ptr<arrow::RecordBatch> rb;
+        while (rdr.ReadNext(&rb).ok() && rb) writer->WriteRecordBatch(*rb);
+        writer->Close();
+    };
+
+    do_put(table1);
+    auto info1 = client->GetFlightInfo(descr).ValueOrDie();
+    auto fr1 = client->DoGet(info1.endpoints()[0].ticket).ValueOrDie();
+    auto table2_res = arrow::Table::FromRecordBatchReader(fr1.get());
+    auto table2 = table2_res.ValueOrDie();
+    std::cout << "After 1st roundtrip:\n" << table2->ToString() << std::endl;
+
+    do_put(table2);
+    auto info2 = client->GetFlightInfo(descr).ValueOrDie();
+    auto fr2 = client->DoGet(info2.endpoints()[0].ticket).ValueOrDie();
+    auto backend = std::make_shared<StreamedBackend>(std::move(fr2));
+
+    using BaseTs = TransformerList<IdentityInt32<>, IdentityDouble<>, IdentityBoolean<>, IdentityString<>>;
+    auto view = TableView<StreamedBackend, BaseTs, MetadataFilter<ProcessTrueKey, ProcessTrueVal>>(backend)
+                    .addTransformer<ReceiveAllTransformer>();
+
+    std::cout << "Rows via iterator with metadata filter after 2nd roundtrip:\n";
+    for (auto row : view) {
+        auto i = row.template get<0>();
+        auto d = row.template get<1>();
+        auto b = row.template get<2>();
+        auto s = row.template get<3>();
+        auto extras = row.receive_all();
+        std::cout << i << ", " << d << ", " << b << ", " << s
+                  << ", extras=" << extras.size() << std::endl;
+    }
+    return 0;
+}
