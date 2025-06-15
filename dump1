@@ -1,1173 +1,316 @@
-#!/usr/bin/env python3
-"""
-Examples demonstrating how different Python processes can communicate
-through the ArrowFlight relay server.
-"""
-
-import pandas as pd
-import numpy as np
-import time
-import multiprocessing as mp
-import threading
-import argparse
-import sys
-from typing import Optional
-
-# Import our client (assuming it's in the same directory)
-from arrow_flight_client import ArrowFlightClient, ArrowFlightDataExchange
-
-
-def data_producer_process(process_id: str, num_batches: int = 5, delay: float = 2.0):
-    """
-    Simulates a data producer process that generates and sends data periodically.
-    """
-    print(f"🏭 Producer {process_id} starting...")
-    
-    try:
-        # Initialize client
-        client = ArrowFlightClient(sender_id=f"producer_{process_id}")
-        
-        for i in range(num_batches):
-            # Generate sample data
-            data = pd.DataFrame({
-                'batch_id': [i] * 100,
-                'timestamp': pd.date_range('2024-01-01', periods=100, freq='1s'),
-                'sensor_value': np.random.randn(100) * 10 + 50,
-                'sensor_id': np.random.choice(['sensor_A', 'sensor_B', 'sensor_C'], 100),
-                'producer_id': [process_id] * 100
-            })
-            
-            # Send data with a unique key
-            key = f"data_batch_{process_id}_{i}"
-            success = client.send_dataframe(
-                key, 
-                data, 
-                f"Batch {i} from producer {process_id}"
-            )
-            
-            if success:
-                print(f"🟢 Producer {process_id} sent batch {i}")
-            else:
-                print(f"🔴 Producer {process_id} failed to send batch {i}")
-            
-            # Send data to a shared channel as well
-            shared_key = f"live_feed"
-            client.send_dataframe(
-                shared_key,
-                data,
-                f"Live data from {process_id} batch {i}"
-            )
-            
-            time.sleep(delay)
-        
-        print(f"✅ Producer {process_id} completed")
-        
-    except Exception as e:
-        print(f"❌ Producer {process_id} error: {e}")
-
-
-def data_consumer_process(process_id: str, keys_to_watch: list, timeout: float = 30.0):
-    """
-    Simulates a data consumer process that retrieves and processes data.
-    """
-    print(f"🔍 Consumer {process_id} starting...")
-    
-    try:
-        # Initialize client
-        client = ArrowFlightClient(sender_id=f"consumer_{process_id}")
-        
-        for key in keys_to_watch:
-            print(f"   Waiting for data: {key}")
-            
-            # Wait for data to become available
-            if client.wait_for_table(key, timeout):
-                # Retrieve and process data
-                df = client.get_dataframe(key)
-                if df is not None:
-                    # Simple processing: calculate statistics
-                    stats = {
-                        'key': key,
-                        'rows': len(df),
-                        'mean_sensor_value': df['sensor_value'].mean() if 'sensor_value' in df.columns else None,
-                        'unique_sensors': df['sensor_id'].nunique() if 'sensor_id' in df.columns else None
-                    }
-                    
-                    print(f"🟢 Consumer {process_id} processed {key}: {stats}")
-                    
-                    # Optionally save processed results back to server
-                    result_key = f"processed_{key}_{process_id}"
-                    result_df = pd.DataFrame([stats])
-                    client.send_dataframe(
-                        result_key,
-                        result_df,
-                        f"Processed results by consumer {process_id}"
-                    )
-                else:
-                    print(f"🔴 Consumer {process_id} failed to retrieve {key}")
-            else:
-                print(f"⏰ Consumer {process_id} timeout waiting for {key}")
-        
-        print(f"✅ Consumer {process_id} completed")
-        
-    except Exception as e:
-        print(f"❌ Consumer {process_id} error: {e}")
-
-
-def live_monitor_process(monitor_id: str, channels: list = None, duration: float = 20.0, 
-                        poll_interval: float = 1.0):
-    """
-    Advanced monitoring process that watches multiple channels for live data.
-    """
-    if channels is None:
-        channels = ["live_feed"]
-    
-    print(f"📊 Monitor {monitor_id} starting...")
-    print(f"   Watching channels: {channels}")
-    print(f"   Duration: {duration}s, Poll interval: {poll_interval}s")
-    
-    try:
-        # Initialize data exchange
-        exchange = ArrowFlightDataExchange(process_id=f"monitor_{monitor_id}")
-        
-        start_time = time.time()
-        last_seen_data = {}  # Track last seen data per channel
-        monitoring_stats = {
-            'total_updates': 0,
-            'channels_seen': set(),
-            'producers_seen': set(),
-            'first_data_time': None,
-            'last_data_time': None
-        }
-        
-        print(f"🟢 Monitor {monitor_id} active - watching for data...")
-        
-        while time.time() - start_time < duration:
-            current_time = time.time()
-            elapsed_time = current_time - start_time
-            
-            # Check each channel
-            for channel in channels:
-                try:
-                    # Get current data
-                    data = exchange.subscribe(channel, as_dataframe=True)
-                    
-                    if data is not None and len(data) > 0:
-                        # Create a unique identifier for this data
-                        data_signature = {
-                            'shape': data.shape,
-                            'columns': list(data.columns),
-                            'first_row_hash': hash(str(data.iloc[0].to_dict())) if len(data) > 0 else None,
-                            'last_row_hash': hash(str(data.iloc[-1].to_dict())) if len(data) > 0 else None
-                        }
-                        
-                        # Check if this is new data
-                        last_signature = last_seen_data.get(channel)
-                        is_new_data = (last_signature is None or 
-                                     last_signature != data_signature)
-                        
-                        if is_new_data:
-                            last_seen_data[channel] = data_signature
-                            monitoring_stats['total_updates'] += 1
-                            monitoring_stats['channels_seen'].add(channel)
-                            
-                            if monitoring_stats['first_data_time'] is None:
-                                monitoring_stats['first_data_time'] = current_time
-                            monitoring_stats['last_data_time'] = current_time
-                            
-                            # Extract metadata from data
-                            producer = 'unknown'
-                            latest_value = None
-                            data_timestamp = None
-                            
-                            if 'producer_id' in data.columns:
-                                producer = data['producer_id'].iloc[0]
-                                monitoring_stats['producers_seen'].add(producer)
-                            
-                            if 'sensor_value' in data.columns:
-                                latest_value = data['sensor_value'].iloc[-1]
-                            
-                            if 'timestamp' in data.columns:
-                                data_timestamp = data['timestamp'].iloc[-1]
-                            
-                            # Log the update
-                            print(f"🔴 [{elapsed_time:.1f}s] Monitor {monitor_id} - "
-                                  f"New data on '{channel}':")
-                            print(f"     Producer: {producer}")
-                            print(f"     Shape: {data.shape}")
-                            print(f"     Latest value: {latest_value}")
-                            if data_timestamp:
-                                print(f"     Data timestamp: {data_timestamp}")
-                            
-                            # Create detailed monitoring record
-                            monitoring_record = pd.DataFrame({
-                                'monitor_id': [monitor_id],
-                                'monitor_time': [current_time],
-                                'elapsed_time': [elapsed_time],
-                                'channel': [channel],
-                                'data_source': [producer],
-                                'data_shape_rows': [data.shape[0]],
-                                'data_shape_cols': [data.shape[1]],
-                                'latest_sensor_value': [latest_value],
-                                'data_timestamp': [str(data_timestamp) if data_timestamp else None],
-                                'columns': [','.join(data.columns)],
-                                'update_sequence': [monitoring_stats['total_updates']]
-                            })
-                            
-                            # Save monitoring results
-                            monitor_key = f"monitor_log_{monitor_id}_{monitoring_stats['total_updates']:03d}"
-                            exchange.publish(
-                                monitor_key,
-                                monitoring_record,
-                                f"Monitor {monitor_id} data update #{monitoring_stats['total_updates']}"
-                            )
-                            
-                            # Also save to a continuous log
-                            exchange.publish(
-                                f"monitor_continuous_log_{monitor_id}",
-                                monitoring_record,
-                                f"Continuous monitoring log from {monitor_id}"
-                            )
-                
-                except Exception as e:
-                    print(f"⚠️  Monitor {monitor_id} error checking channel '{channel}': {e}")
-            
-            # Periodic status update
-            if int(elapsed_time) % 5 == 0 and elapsed_time > 0:
-                print(f"📊 [{elapsed_time:.0f}s] Monitor {monitor_id} status: "
-                      f"{monitoring_stats['total_updates']} updates, "
-                      f"{len(monitoring_stats['channels_seen'])} channels active, "
-                      f"{len(monitoring_stats['producers_seen'])} producers seen")
-            
-            time.sleep(poll_interval)
-        
-        # Final summary
-        total_time = time.time() - start_time
-        print(f"\n✅ Monitor {monitor_id} completed after {total_time:.1f}s")
-        print(f"   📈 Summary:")
-        print(f"     Total data updates detected: {monitoring_stats['total_updates']}")
-        print(f"     Active channels: {list(monitoring_stats['channels_seen'])}")
-        print(f"     Producers seen: {list(monitoring_stats['producers_seen'])}")
-        
-        if monitoring_stats['first_data_time']:
-            data_active_time = monitoring_stats['last_data_time'] - monitoring_stats['first_data_time']
-            print(f"     Data activity period: {data_active_time:.1f}s")
-            print(f"     Average update rate: {monitoring_stats['total_updates']/data_active_time:.2f} updates/sec")
-        
-        # Save final summary
-        summary_data = pd.DataFrame({
-            'monitor_id': [monitor_id],
-            'total_runtime': [total_time],
-            'total_updates': [monitoring_stats['total_updates']],
-            'channels_monitored': [','.join(channels)],
-            'channels_active': [','.join(monitoring_stats['channels_seen'])],
-            'producers_seen': [','.join(monitoring_stats['producers_seen'])],
-            'completion_time': [time.time()]
-        })
-        
-        exchange.publish(
-            f"monitor_summary_{monitor_id}",
-            summary_data,
-            f"Final monitoring summary from {monitor_id}"
-        )
-        
-    except Exception as e:
-        print(f"❌ Monitor {monitor_id} error: {e}")
-
-
-def aggregator_process(aggregator_id: str, wait_time: float = 15.0):
-    """
-    Simulates an aggregator process that collects data from multiple sources.
-    """
-    print(f"📈 Aggregator {aggregator_id} starting...")
-    
-    try:
-        # Initialize client
-        client = ArrowFlightClient(sender_id=f"aggregator_{aggregator_id}")
-        
-        # Wait for some data to accumulate
-        time.sleep(wait_time)
-        
-        # Get all available tables
-        tables = client.list_tables()
-        print(f"   Found {len(tables)} tables on server")
-        
-        # Collect all data that matches our pattern
-        all_data = []
-        for table_info in tables:
-            key = table_info['key']
-            if 'data_batch_' in key:  # Only process batch data
-                df = client.get_dataframe(key)
-                if df is not None:
-                    all_data.append(df)
-        
-        if all_data:
-            # Aggregate all data
-            combined_df = pd.concat(all_data, ignore_index=True)
-            
-            # Calculate aggregate statistics
-            aggregated_stats = pd.DataFrame({
-                'total_rows': [len(combined_df)],
-                'unique_producers': [combined_df['producer_id'].nunique()],
-                'mean_sensor_value': [combined_df['sensor_value'].mean()],
-                'std_sensor_value': [combined_df['sensor_value'].std()],
-                'min_sensor_value': [combined_df['sensor_value'].min()],
-                'max_sensor_value': [combined_df['sensor_value'].max()],
-                'aggregation_time': [time.time()]
-            })
-            
-            # Send aggregated results
-            success = client.send_dataframe(
-                f"aggregated_results_{aggregator_id}",
-                aggregated_stats,
-                f"Aggregated statistics by {aggregator_id}"
-            )
-            
-            if success:
-                print(f"🟢 Aggregator {aggregator_id} processed {len(all_data)} datasets")
-                print(f"   Total rows: {len(combined_df)}")
-                print(f"   Mean sensor value: {combined_df['sensor_value'].mean():.2f}")
-            else:
-                print(f"🔴 Aggregator {aggregator_id} failed to send results")
-        else:
-            print(f"⚠️  Aggregator {aggregator_id} found no data to process")
-        
-        print(f"✅ Aggregator {aggregator_id} completed")
-        
-    except Exception as e:
-        print(f"❌ Aggregator {aggregator_id} error: {e}")
-
-
-def run_multi_process_example():
-    """
-    Run a complete multi-process example demonstrating the relay server.
-    """
-    print("🚀 Starting Multi-Process ArrowFlight Relay Example")
-    print("=" * 60)
-    
-    # Test server connection first
-    try:
-        test_client = ArrowFlightClient()
-        print("✅ Server connection successful")
-    except Exception as e:
-        print(f"❌ Cannot connect to server: {e}")
-        print("   Make sure the C++ ArrowFlight server is running!")
-        return
-    
-    # Clear any existing data
-    test_client.clear_server()
-    print("🧹 Cleared existing data from server")
-    
-    processes = []
-    
-    try:
-        # Start producer processes
-        for i in range(2):
-            p = mp.Process(
-                target=data_producer_process,
-                args=(f"P{i}", 3, 2.0)  # 3 batches, 2 second delay
-            )
-            p.start()
-            processes.append(p)
-        
-        # Start monitor process
-        monitor_p = mp.Process(
-            target=live_monitor_process,
-            args=("M1", ["live_feed", "data_batch_P0_0"], 15.0, 1.0)  # Monitor multiple channels
-        )
-        monitor_p.start()
-        processes.append(monitor_p)
-        
-        # Start consumer processes (they will wait for specific data)
-        keys_to_consume = [
-            ["data_batch_P0_0", "data_batch_P0_1"],
-            ["data_batch_P1_0", "data_batch_P1_2"]
-        ]
-        
-        for i, keys in enumerate(keys_to_consume):
-            p = mp.Process(
-                target=data_consumer_process,
-                args=(f"C{i}", keys, 30.0)
-            )
-            p.start()
-            processes.append(p)
-        
-        # Start aggregator process
-        agg_p = mp.Process(
-            target=aggregator_process,
-            args=("A1", 10.0)  # Wait 10 seconds before aggregating
-        )
-        agg_p.start()
-        processes.append(agg_p)
-        
-        # Wait for all processes to complete
-        for p in processes:
-            p.join()
-        
-        print("\n📊 Final Server Statistics:")
-        print("=" * 40)
-        stats = test_client.get_server_stats()
-        print(f"Total stored tables: {stats.get('stored_tables', 'unknown')}")
-        
-        for table_info in stats.get('tables', []):
-            print(f"  • {table_info['key']}: {table_info['rows']} rows, "
-                  f"age {table_info['age_seconds']}s")
-        
-        print("\n🎉 Multi-process example completed successfully!")
-        
-    except KeyboardInterrupt:
-        print("\n⚠️  Interrupted by user")
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-
-
-def run_advanced_monitoring_example():
-    """
-    Demonstrate advanced monitoring capabilities.
-    """
-    print("🔍 Starting Advanced Monitoring Example")
-    print("=" * 50)
-    
-    try:
-        # Test server connection
-        test_client = ArrowFlightClient()
-        print("✅ Server connection successful")
-        
-        # Clear existing data
-        test_client.clear_server()
-        print("🧹 Cleared existing data")
-        
-        processes = []
-        
-        # Start multiple producers with different patterns
-        producer_configs = [
-            ("FastProducer", 5, 0.5),    # 5 batches, 0.5s delay
-            ("SlowProducer", 3, 2.0),    # 3 batches, 2s delay
-            ("BurstProducer", 8, 0.2),   # 8 batches, 0.2s delay
-        ]
-        
-        for prod_id, batches, delay in producer_configs:
-            p = mp.Process(
-                target=data_producer_process,
-                args=(prod_id, batches, delay)
-            )
-            p.start()
-            processes.append(p)
-        
-        # Start advanced monitor watching multiple channels
-        monitor_channels = [
-            "live_feed",
-            "data_batch_FastProducer_0",
-            "data_batch_SlowProducer_0",
-            "data_batch_BurstProducer_0"
-        ]
-        
-        monitor_p = mp.Process(
-            target=live_monitor_process,
-            args=("AdvancedMonitor", monitor_channels, 12.0, 0.5)  # 12s duration, 0.5s poll
-        )
-        monitor_p.start()
-        processes.append(monitor_p)
-        
-        # Wait for all processes
-        for p in processes:
-            p.join()
-        
-        # Analyze monitoring results
-        print("\n📊 Analyzing monitoring results...")
-        time.sleep(1)  # Give time for final writes
-        
-        tables = test_client.list_tables()
-        monitor_tables = [t for t in tables if 'monitor' in t['key']]
-        
-        print(f"📋 Found {len(monitor_tables)} monitoring result tables:")
-        for table in monitor_tables:
-            print(f"   • {table['key']}: {table['total_records']} records")
-        
-        # Get and display summary
-        summary_data = test_client.get_dataframe("monitor_summary_AdvancedMonitor")
-        if summary_data is not None:
-            print(f"\n📈 Monitor Summary:")
-            print(f"   Runtime: {summary_data['total_runtime'].iloc[0]:.1f}s")
-            print(f"   Updates detected: {summary_data['total_updates'].iloc[0]}")
-            print(f"   Channels monitored: {summary_data['channels_monitored'].iloc[0]}")
-            print(f"   Active channels: {summary_data['channels_active'].iloc[0]}")
-            print(f"   Producers seen: {summary_data['producers_seen'].iloc[0]}")
-        
-        print("\n🎉 Advanced monitoring example completed!")
-        
-    except Exception as e:
-        print(f"❌ Error in advanced monitoring example: {e}")
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-
-
-def run_simple_example():
-    """
-    Run a simple single-process example.
-    """
-    print("🚀 Starting Simple ArrowFlight Example")
-    print("=" * 40)
-    
-    try:
-        # Initialize data exchange
-        exchange = ArrowFlightDataExchange(process_id="simple_example")
-        
-        # Create sample data
-        sample_data = pd.DataFrame({
-            'id': range(100),
-            'value': np.random.randn(100),
-            'category': np.random.choice(['A', 'B', 'C'], 100)
-        })
-        
-        # Publish data
-        print("📤 Publishing sample data...")
-        success = exchange.publish("simple_channel", sample_data, "Simple example data")
-        print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
-        
-        # Subscribe to data
-        print("📥 Subscribing to data...")
-        retrieved_data = exchange.subscribe("simple_channel")
-        
-        if retrieved_data is not None:
-            print(f"   ✅ Retrieved {len(retrieved_data)} rows")
-            print(f"   Sample: {retrieved_data.head()}")
-        else:
-            print("   ❌ Failed to retrieve data")
-        
-        # List channels
-        channels = exchange.list_channels()
-        print(f"📋 Available channels: {channels}")
-        
-        # Get server status
-        status = exchange.get_server_status()
-        print(f"📊 Server has {status.get('stored_tables', 0)} stored tables")
-        
-        print("🎉 Simple example completed!")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-    """
-    Run a simple single-process example.
-    """
-    print("🚀 Starting Simple ArrowFlight Example")
-    print("=" * 40)
-    
-    try:
-        # Initialize data exchange
-        exchange = ArrowFlightDataExchange(process_id="simple_example")
-        
-        # Create sample data
-        sample_data = pd.DataFrame({
-            'id': range(100),
-            'value': np.random.randn(100),
-            'category': np.random.choice(['A', 'B', 'C'], 100)
-        })
-        
-        # Publish data
-        print("📤 Publishing sample data...")
-        success = exchange.publish("simple_channel", sample_data, "Simple example data")
-        print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
-        
-        # Subscribe to data
-        print("📥 Subscribing to data...")
-        retrieved_data = exchange.subscribe("simple_channel")
-        
-        if retrieved_data is not None:
-            print(f"   ✅ Retrieved {len(retrieved_data)} rows")
-            print(f"   Sample: {retrieved_data.head()}")
-        else:
-            print("   ❌ Failed to retrieve data")
-        
-        # List channels
-        channels = exchange.list_channels()
-        print(f"📋 Available channels: {channels}")
-        
-        # Get server status
-        status = exchange.get_server_status()
-        print(f"📊 Server has {status.get('stored_tables', 0)} stored tables")
-        
-        print("🎉 Simple example completed!")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
-
-def main():
-    """
-    Main function with command line argument parsing.
-    """
-    parser = argparse.ArgumentParser(description="ArrowFlight Relay Examples")
-    parser.add_argument(
-        "--mode",
-        choices=["simple", "multi", "advanced-monitor", "producer", "consumer", "monitor", "aggregator"],
-        default="simple",
-        help="Example mode to run"
-    )
-    parser.add_argument("--id", default="1", help="Process ID")
-    parser.add_argument("--keys", nargs="*", help="Keys to watch (for consumer)")
-    parser.add_argument("--channels", nargs="*", help="Channels to monitor (for monitor mode)")
-    parser.add_argument("--channel", default="live_feed", help="Single channel to monitor (deprecated, use --channels)")
-    parser.add_argument("--duration", type=float, default=20.0, help="Duration to run")
-    parser.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for monitor")
-    
-    args = parser.parse_args()
-    
-    if args.mode == "simple":
-        run_simple_example()
-    elif args.mode == "multi":
-        run_multi_process_example()
-    elif args.mode == "advanced-monitor":
-        run_advanced_monitoring_example()
-    elif args.mode == "producer":
-        data_producer_process(args.id)
-    elif args.mode == "consumer":
-        keys = args.keys or [f"data_batch_{args.id}_0"]
-        data_consumer_process(args.id, keys)
-    elif args.mode == "monitor":
-        channels = args.channels or [args.channel]  # Use new channels parameter or fall back to single channel
-        live_monitor_process(args.id, channels, args.duration, args.poll_interval)
-    elif args.mode == "aggregator":
-        aggregator_process(args.id)
-    else:
-        print(f"Unknown mode: {args.mode}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-// ArrowTableAPI.h
+// === ArrowTableIterator.hpp ===
 #pragma once
 
 #include <arrow/api.h>
-#include <arrow/flight/api.h>
-#include <arrow/result.h>
-#include <arrow/table.h>
-#include <arrow/io/memory.h>
-#include <arrow/ipc/api.h>
-#include <arrow/ipc/options.h>
 #include <arrow/record_batch.h>
-#include <arrow/record_batch_reader.h>
-#include <arrow/compute/api.h>
-#include <arrow/compute/exec.h>
-#include <arrow/compute/kernels/compare.h>
-#include <arrow/compute/kernels/unique.h>
-#include <variant>
+#include <arrow/flight/api.h>
+#include <vector>
 #include <memory>
-#include <concepts>
-#include <queue>
-#include <deque>
-#include <unordered_set>
-#include <unordered_map>
-#include <optional>
-#include <functional>
+#include <tuple>
+#include <string>
 #include <type_traits>
-#include <iostream>
-#include <Windows.h>
-#include <comutil.h>
-#include <guiddef.h>
-#include <oaidl.h>
-#include <oleauto.h>
-#include <esriCore.h>
-#pragma comment(lib, "comsuppw.lib")
 
-// Concept: Requires that a Transformer can transform to/from arrow::Array or arrow::Scalar
-template <typename T, typename ArrowT>
-concept ArrowTransformer = requires(T t, ArrowT arrow_val) {
-    { t.to_arrow(arrow_val) } -> std::same_as<arrow::Result<std::shared_ptr<arrow::Scalar>>>;
-    { t.from_arrow(arrow_val) } -> std::same_as<arrow::Result<T>>;
-};
-
-// BasicVariant transformer for primitive Arrow types
-struct BasicVariant {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT& val) const {
-        switch (val.vt) {
-            case VT_I4:
-                return arrow::MakeScalar(static_cast<int32_t>(val.lVal));
-            case VT_I8:
-                return arrow::MakeScalar(static_cast<int64_t>(val.llVal));
-            case VT_R8:
-                return arrow::MakeScalar(val.dblVal);
-            case VT_BSTR:
-                return arrow::MakeScalar(std::string(_bstr_t(val.bstrVal)));
-            default:
-                return arrow::Status::NotImplemented("Unsupported VARIANT type in BasicVariant");
-        }
+// ---- Transformer Framework ----
+// Base Transformer CRTP: specialize for ArrowType and UserType
+template<typename ArrowType, typename UserType, typename Derived>
+struct Transformer {
+    using arrow_c_type = typename ArrowType::c_type;
+    static constexpr UserType forward(arrow_c_type v) {
+        return Derived::forward_impl(v);
     }
-
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>& scalar) const {
-        VARIANT var;
-        VariantInit(&var);
-        if (scalar->type->id() == arrow::Type::INT32) {
-            var.vt = VT_I4;
-            var.lVal = static_cast<int32_t>(std::static_pointer_cast<arrow::Int32Scalar>(scalar)->value);
-        } else if (scalar->type->id() == arrow::Type::INT64) {
-            var.vt = VT_I8;
-            var.llVal = std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value;
-        } else if (scalar->type->id() == arrow::Type::DOUBLE) {
-            var.vt = VT_R8;
-            var.dblVal = std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value;
-        } else if (scalar->type->id() == arrow::Type::STRING) {
-            auto str = std::static_pointer_cast<arrow::StringScalar>(scalar)->ToString();
-            var.vt = VT_BSTR;
-            var.bstrVal = SysAllocString(std::wstring(str.begin(), str.end()).c_str());
-        } else {
-            return arrow::Status::NotImplemented("Unsupported Arrow type in BasicVariant");
-        }
-        return var;
+    static constexpr arrow_c_type backward(UserType v) {
+        return Derived::backward_impl(v);
     }
 };
 
-// Transformers for ESRI types
-struct GeometryTransform {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
-        return arrow::Status::NotImplemented("GeometryTransform::to_arrow not implemented");
-    }
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
-        return arrow::Status::NotImplemented("GeometryTransform::from_arrow not implemented");
+// Identity transformer
+template<typename ArrowType>
+struct Identity : Transformer<ArrowType, typename ArrowType::c_type, Identity<ArrowType>> {
+    static constexpr typename ArrowType::c_type forward_impl(typename ArrowType::c_type v) { return v; }
+    static constexpr typename ArrowType::c_type backward_impl(typename ArrowType::c_type v) { return v; }
+};
+
+// ReceiveAll transformer: catches any arrow::Scalar
+struct ReceiveAllTransformer {
+    using UserType = std::shared_ptr<arrow::Scalar>;
+    static std::shared_ptr<arrow::Scalar> forward_impl(std::shared_ptr<arrow::Scalar> v) { return v; }
+    static std::shared_ptr<arrow::Scalar> backward_impl(std::shared_ptr<arrow::Scalar> v) { return v; }
+};
+
+// ---- Transformer List with currying ----
+template<typename... Ts>
+struct TransformerList {
+    template<typename New>
+    using append = TransformerList<Ts..., New>;
+};
+
+template<typename List, size_t N>
+struct TransformerAt;
+template<typename Head, typename... Tail>
+struct TransformerAt<TransformerList<Head, Tail...>, 0> { using type = Head; };
+template<typename Head, typename... Tail, size_t N>
+struct TransformerAt<TransformerList<Head, Tail...>, N> : TransformerAt<TransformerList<Tail...>, N-1> {};
+
+// ---- Metadata Checker ----
+// Default: allow all rows
+template<typename SchemaMetadataKey, typename SchemaMetadataValue>
+struct MetadataFilter {
+    static bool check(const std::shared_ptr<arrow::Schema>& schema,
+                      std::shared_ptr<arrow::RecordBatch>,
+                      int64_t) {
+        auto md = schema->metadata();
+        return md && md->Get(SchemaMetadataKey::value).ValueOr("") == SchemaMetadataValue::value;
     }
 };
 
-struct IvariantTransform {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT& val) const {
-        // TODO: Convert VARIANT to Arrow
-        return arrow::Status::NotImplemented("IvariantTransform::to_arrow not implemented");
-    }
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>& scalar) const {
-        VARIANT var;
-        VariantInit(&var);
-        if (auto int_scalar = std::dynamic_pointer_cast<arrow::Int64Scalar>(scalar)) {
-            var.vt = VT_I8;
-            var.llVal = int_scalar->value;
-        } else if (auto str_scalar = std::dynamic_pointer_cast<arrow::StringScalar>(scalar)) {
-            var.vt = VT_BSTR;
-            var.bstrVal = ::SysAllocString(std::wstring(str_scalar->ToString().begin(), str_scalar->ToString().end()).c_str());
-        } else {
-            return arrow::Status::NotImplemented("Unsupported VARIANT conversion");
-        }
-        return var;
+struct AllowAll {
+    static bool check(const std::shared_ptr<arrow::Schema>&, std::shared_ptr<arrow::RecordBatch>, int64_t) {
+        return true;
     }
 };
 
-struct GuidTransform {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
-        return arrow::Status::NotImplemented("GuidTransform::to_arrow not implemented");
-    }
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
-        return arrow::Status::NotImplemented("GuidTransform::from_arrow not implemented");
-    }
-};
-
-struct RasterTransform {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
-        return arrow::Status::NotImplemented("RasterTransform::to_arrow not implemented");
-    }
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
-        return arrow::Status::NotImplemented("RasterTransform::from_arrow not implemented");
-    }
-};
-
-// Compose multiple transformers using inheritance-like layering
-template <typename Base, typename Derived>
-struct TransformerChain : public Base, public Derived {
-    using Base::to_arrow;
-    using Base::from_arrow;
-    using Derived::to_arrow;
-    using Derived::from_arrow;
-};
-
-struct DefaultTransformer {
-    arrow::Result<std::shared_ptr<arrow::Scalar>> to_arrow(const VARIANT&) const {
-        return arrow::Status::NotImplemented("DefaultTransformer::to_arrow not implemented");
-    }
-    arrow::Result<VARIANT> from_arrow(const std::shared_ptr<arrow::Scalar>&) const {
-        return arrow::Status::NotImplemented("DefaultTransformer::from_arrow not implemented");
-    }
-};
-
-class ArrowTableAPI {
+// ---- Streamed Backend ----
+class StreamedBackend {
 public:
-    using TransformerFactory = std::function<std::unique_ptr<DefaultTransformer>()>;
-
-    static void RegisterTransformer(const std::string& esri_type, TransformerFactory factory) {
-        GetRegistry()[esri_type] = std::move(factory);
+    explicit StreamedBackend(std::unique_ptr<arrow::flight::FlightStreamReader> reader)
+        : reader_(std::move(reader)) {}
+    std::shared_ptr<arrow::RecordBatch> next_batch() {
+        auto res = reader_->Next();
+        if (res.ok() && res.ValueUnsafe()) return res.ValueUnsafe();
+        return nullptr;
     }
-
+    std::shared_ptr<arrow::Schema> schema() const { return reader_->schema(); }
 private:
-    static std::unordered_map<std::string, TransformerFactory>& GetRegistry() {
-        static std::unordered_map<std::string, TransformerFactory> registry;
-        return registry;
-    }
+    std::unique_ptr<arrow::flight::FlightStreamReader> reader_;
+};
 
+// ---- Row Proxy ----
+template<typename Transformers>
+class RowProxy {
 public:
+    RowProxy(std::shared_ptr<arrow::RecordBatch> batch, int64_t row)
+        : batch_(batch), row_(row) {}
+
+    // get by index
+    template<size_t I>
+    auto get() const {
+        using TransformerT = typename TransformerAt<Transformers, I>::type;
+        using CType = typename TransformerT::arrow_c_type;
+        auto array = std::static_pointer_cast<typename arrow::NumericArray<typename CType::TypeClass>>(batch_->column(I));
+        return TransformerT::forward(array->Value(row_));
+    }
+    // catch-all sink
+    std::vector<std::shared_ptr<arrow::Scalar>> receive_all() const {
+        std::vector<std::shared_ptr<arrow::Scalar>> extras;
+        size_t ncol = batch_->num_columns();
+        constexpr size_t Tcols = std::tuple_size<Transformers>::value;
+        for (size_t i = Tcols; i < ncol; ++i) {
+            auto res = batch_->column(i)->GetScalar(row_);
+            if (res.ok()) extras.push_back(res.ValueUnsafe());
+        }
+        return extras;
+    }
+private:
+    std::shared_ptr<arrow::RecordBatch> batch_;
+    int64_t row_;
+};
+
+// ---- Iterator ----
+template<typename Backend, typename Transformers, typename MetaChecker = AllowAll>
+class RowIterator {
 public:
-    // Support for pipeline-style filters and transforms
-
-// Type-based conditional transform pipe
-template <arrow::Type::type ArrowTypeID, typename Transformer>
-struct ForArrowType {
-    auto operator()(auto&& builder) const {
-        return std::forward<decltype(builder)>(builder)
-            .conditionalTransform<Transformer>(
-                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
-                    return field->type()->id() == ArrowTypeID;
-                });
+    using value_type = RowProxy<Transformers>;
+    RowIterator(std::shared_ptr<Backend> backend, bool end = false)
+        : backend_(backend) {
+        if (!end) { advance_batch(); advance_row(); }
+        row_idx_ = end ? -1 : row_idx_;
     }
+    bool operator!=(RowIterator const& other) const {
+        return row_idx_ != other.row_idx_ || batch_.get() != other.batch_.get();
+    }
+    RowIterator& operator++() { advance_row(); return *this; }
+    value_type operator*() const { return {batch_, row_idx_}; }
+private:
+    void advance_batch() { batch_ = backend_->next_batch(); row_idx_ = 0; }
+    void advance_row() {
+        while (batch_) {
+            if (row_idx_ < batch_->num_rows() && MetaChecker::check(batch_->schema(), batch_, row_idx_)) return;
+            if (++row_idx_ >= batch_->num_rows()) advance_batch();
+        }
+        row_idx_ = -1;
+    }
+    std::shared_ptr<Backend> backend_;
+    std::shared_ptr<arrow::RecordBatch> batch_;
+    int64_t row_idx_;
 };
 
-template <arrow::Type::type ArrowTypeID, typename Transformer>
-ForArrowType<ArrowTypeID, Transformer> forType() {
-    return {};
-}
-
-// Metadata-based conditional transform pipe
-
-// Match a single esri_type
-template <const char* TargetType, typename Transformer>
-struct ForEsriType {
-    auto operator()(auto&& builder) const {
-        return std::forward<decltype(builder)>(builder)
-            .conditionalTransform<Transformer>(
-                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
-                    std::string type;
-                    auto meta = field->metadata();
-                    return meta && meta->Get("esri_type", &type) && type == TargetType;
-                });
+// ---- Table View ----
+template<typename Backend, typename Transformers, typename MetaChecker = AllowAll>
+class TableView {
+public:
+    explicit TableView(std::shared_ptr<Backend> backend) : backend_(backend) {}
+    auto begin() { return RowIterator<Backend, Transformers, MetaChecker>(backend_, false); }
+    auto end()   { return RowIterator<Backend, Transformers, MetaChecker>(backend_, true); }
+    // currying syntax
+    template<typename NewTransformer>
+    auto addTransformer() const {
+        using NewList = typename Transformers::template append<NewTransformer>;
+        return TableView<Backend, NewList, MetaChecker>(backend_);
     }
+private:
+    std::shared_ptr<Backend> backend_;
 };
 
-// Match multiple esri_types
-template <typename Transformer, const char*... EsriTypes>
-struct ForEsriTypes {
-    auto operator()(auto&& builder) const {
-        return std::forward<decltype(builder)>(builder)
-            .conditionalTransform<Transformer>(
-                [](const auto&, const std::shared_ptr<arrow::Field>& field) {
-                    std::string type;
-                    auto meta = field->metadata();
-                    if (!meta || !meta->Get("esri_type", &type)) return false;
-                    return ((type == EsriTypes) || ...);
-                });
-    }
-};                });
-    }
-};
 
-#define DEFINE_ESRI_TYPE_KEY(name) constexpr char name[] = #name;
-DEFINE_ESRI_TYPE_KEY(geometry)
-DEFINE_ESRI_TYPE_KEY(raster)
-DEFINE_ESRI_TYPE_KEY(guid)
-DEFINE_ESRI_TYPE_KEY(variant)
+// === flight_double_roundtrip_client.cpp ===
+#include "ArrowTableIterator.hpp"
+#include <arrow/api.h>
+#include <arrow/flight/api.h>
+#include <arrow/record_batch.h>
+#include <arrow/table.h>
+#include <iostream>
 
-#undef DEFINE_ESRI_TYPE_KEY
-    template <typename BuilderT, typename FilterT>
-    friend BuilderT operator|(BuilderT&& builder, FilterT&& filter) {
-            if constexpr (std::is_invocable_v<FilterT, BuilderT>) {
-                return filter(std::forward<BuilderT>(builder));
-            } else {
-                return std::forward<BuilderT>(builder).transform<std::decay_t<FilterT>>();
-            }
-        }
+struct ProcessTrueKey { static constexpr const char* value = "process"; };
+struct ProcessTrueVal { static constexpr const char* value = "true"; };
 
-        friend auto operator|(Builder&& builder, std::invocable<Builder> auto&& filter) {
-            return filter(std::move(builder));
-        }
+int main() {
+    auto loc = arrow::flight::Location::ForGrpcTcp("localhost", 8815).ValueOrDie();
+    auto client = arrow::flight::FlightClient::Connect(loc).ValueOrDie();
+    arrow::flight::FlightDescriptor descr = arrow::flight::FlightDescriptor::Command("my_table");
 
+    // Build and set schema metadata to enable filter
+    arrow::KeyValueMetadata metadata;
+    metadata.Append("process", "true");
+    auto schema = arrow::schema({
+        arrow::field("i32", arrow::int32()),
+        arrow::field("f64", arrow::float64()),
+        arrow::field("bol", arrow::boolean()),
+        arrow::field("str", arrow::utf8())
+    }, std::make_shared<arrow::KeyValueMetadata>(metadata));
 
-        return std::forward<BuilderT>(builder).transform<std::decay_t<FilterT>>();
-    }
+    // Build table
+    arrow::Int32Builder b1; b1.AppendValues({1,2,3}); std::shared_ptr<arrow::Array> a1; b1.Finish(&a1);
+    arrow::DoubleBuilder b2; b2.AppendValues({0.1,0.2,0.3}); std::shared_ptr<arrow::Array> a2; b2.Finish(&a2);
+    arrow::BooleanBuilder b3; b3.AppendValues({true,false,true}); std::shared_ptr<arrow::Array> a3; b3.Finish(&a3);
+    arrow::StringBuilder b4; b4.AppendValues({"a","b","c"}); std::shared_ptr<arrow::Array> a4; b4.Finish(&a4);
+    auto table1 = arrow::Table::Make(schema, {a1,a2,a3,a4});
 
-    template <typename Transformer_ = DefaultTransformer>
-    class Builder {
-    public:
-        Builder(std::shared_ptr<arrow::Table> table) : table_(std::move(table)) {}
-        Builder(std::shared_ptr<arrow::Table> table, std::shared_ptr<arrow::RecordBatchReader> reader) : table_(std::move(table)), reader_(std::move(reader)) {}
-
-        template <typename NewTransformer, typename... Args>
-        auto transform(Args&&... args) && {
-            using Next = TransformerChain<Transformer_, NewTransformer>;
-            Builder<Next> next_builder(reader_ ? nullptr : table_, reader_);
-            next_builder.set_transformer(Next(std::forward<Args>(args)...));
-            return std::move(next_builder);
-        }
-
-        template <typename NewTransformer>
-        auto conditionalTransform(
-            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
-            std::function<void()> fallback = nullptr
-        ) && {
-            bool apply = false;
-            if (table_) {
-                auto schema = table_->schema();
-                for (const auto& field : schema->fields()) {
-                    if (should_apply(schema, field)) {
-                        apply = true;
-                        break;
-                    }
-                }
-            }
-            if (apply) {
-                return std::move(*this).transform<NewTransformer>();
-            } else if (fallback) {
-                fallback();
-            }
-            return std::move(*this);
-        }
-
-        template <typename... Chains>
-        auto conditionalTransformChainAll(Chains&&... chains) && {
-            int step = 0;
-            ((std::wcout << L"[Chain " << step++ << L"] applying conditional transform...
-"),
-              std::move(*this).conditionalTransformChain(std::forward<Chains>(chains)))...
-        }
-        }
-
-        template <typename... Transforms>
-        auto conditionalTransformChain(
-            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
-            std::function<void()> fallback = nullptr
-        ) && {
-            return conditionalTransformChainImpl<Transforms...>(should_apply, fallback);
-        }
-
-        template <typename... Transforms>
-        auto conditionalTransformByFieldName(const std::vector<std::string>& names, std::function<void()> fallback = nullptr) && {
-            return conditionalTransformChainImpl<Transforms...>(
-                [=](const auto&, const std::shared_ptr<arrow::Field>& field) {
-                    return std::find(names.begin(), names.end(), field->name()) != names.end();
-                },
-                fallback);
-        }
-
-        template <typename... Transforms>
-        auto conditionalTransformByFieldName(const std::string& name, std::function<void()> fallback = nullptr) && {
-            return conditionalTransformChainImpl<Transforms...>(
-                [=](const auto&, const std::shared_ptr<arrow::Field>& field) {
-                    return field->name() == name;
-                },
-                fallback);
-        }
-
-        template <typename... Transforms>
-        auto conditionalTransformByIndex(const std::vector<int>& indices, std::function<void()> fallback = nullptr) && {
-            return conditionalTransformChainImpl<Transforms...>(
-                [=](const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<arrow::Field>& field) {
-                    for (int index : indices) {
-                        if (index >= 0 && index < schema->num_fields() && schema->field(index) == field)
-                            return true;
-                    }
-                    return false;
-                },
-                fallback);
-        }
-
-        template <typename... Transforms>
-        auto conditionalTransformByIndex(int index, std::function<void()> fallback = nullptr) && {
-            return conditionalTransformChainImpl<Transforms...>(
-                [=](const std::shared_ptr<arrow::Schema>& schema, const std::shared_ptr<arrow::Field>& field) {
-                    return index >= 0 && index < schema->num_fields() && schema->field(index) == field;
-                },
-                fallback);
-        }
-
-    private:
-        template <typename... Transforms>
-        auto conditionalTransformChainImpl(
-            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
-            std::function<void()> fallback = nullptr
-        ) && {
-            std::function<bool(const std::shared_ptr<arrow::Schema>&, const std::shared_ptr<arrow::Field>&)> should_apply,
-            std::function<void()> fallback = nullptr
-        ) && {
-            bool applied = false;
-            if (table_) {
-                auto schema = table_->schema();
-                for (const auto& field : schema->fields()) {
-                    if (should_apply(schema, field)) {
-                        applied = true;
-                        break;
-                    }
-                }
-            }
-            if constexpr (sizeof...(Transforms) > 0) {
-                if (applied) {
-                    return (std::move(*this).transform<Transforms>() , ...);
-                } else if (fallback) {
-                    fallback();
-                }
-            }
-            return std::move(*this);
-        }
-            using Next = TransformerChain<Transformer_, NewTransformer>;
-            Builder<Next> next_builder(reader_ ? nullptr : table_, reader_);
-            next_builder.set_transformer(Next(std::forward<Args>(args)...));
-            return std::move(next_builder);
-        }
-
-        Builder&& autoTransformFromMetadata() && {
-            if (table_) {
-                for (int i = 0; i < table_->num_columns(); ++i) {
-                    const auto& field = table_->field(i);
-                    const auto& meta = field->metadata();
-                    if (!meta) continue;
-                    std::string type;
-                    if (meta->Get("esri_type", &type)) {
-    std::cout << "Auto-transforming column " << field->name() << " with type " << type << std::endl;
-    auto& registry = GetRegistry();
-    if (auto it = registry.find(type); it != registry.end()) {
-        auto transformer_ptr = it->second();
-        *this = std::move(*this).transform<std::decay_t<decltype(*transformer_ptr)>>();
-    } else if (type == "variant") {
-                            *this = std::move(*this).transform<IvariantTransform>();
-                        } else if (type == "guid") {
-                            *this = std::move(*this).transform<GuidTransform>();
-                        } else if (type == "raster") {
-                            *this = std::move(*this).transform<RasterTransform>();
-                        }
-                    }
-                }
-            }
-            return std::move(*this);
-        }
-
-        template <typename FinalTransformer>
-        class Wrapper {
-        public:
-            Wrapper(std::shared_ptr<arrow::Table> table, std::shared_ptr<arrow::RecordBatchReader> reader, FinalTransformer transformer)
-                : table_(std::move(table)), reader_(std::move(reader)), transformer_(std::move(transformer)) {
-                if (table_) {
-                    arrow::TableBatchReader table_reader(*table_);
-                    reader_ = std::make_shared<arrow::TableBatchReader>(std::move(table_reader));
-                }
-                ARROW_ASSIGN_OR_RAISE(current_batch_, reader_->Next());
-            }
-
-            arrow::Result<std::vector<VARIANT>> NextRow() {
-                while (current_batch_ && row_index_ >= current_batch_->num_rows()) {
-                    ARROW_ASSIGN_OR_RAISE(current_batch_, reader_->Next());
-                    row_index_ = 0;
-                    if (!current_batch_) return arrow::Status::IndexError("No more rows");
-                }
-
-                std::vector<VARIANT> result;
-                std::cout << "Row " << row_index_ << ": ";
-                for (int i = 0; i < current_batch_->num_columns(); ++i) {
-                    ARROW_ASSIGN_OR_RAISE(auto scalar, current_batch_->column(i)->GetScalar(row_index_));
-                    ARROW_ASSIGN_OR_RAISE(auto val, transformer_.from_arrow(scalar));
-                    result.push_back(val);
-                    _bstr_t bs(val);
-                    std::wcout << static_cast<wchar_t*>(bs) << L" ";
-                }
-                std::wcout << std::endl;
-                ++row_index_;
-                return result;
-            }
-
-        private:
-            std::shared_ptr<arrow::Table> table_;
-            std::shared_ptr<arrow::RecordBatchReader> reader_;
-            std::shared_ptr<arrow::RecordBatch> current_batch_;
-            FinalTransformer transformer_;
-            int64_t row_index_ = 0;
-        };
-
-        auto rowIterator() && {
-            return Wrapper<Transformer_>(table_, reader_, transformer_);
-        }
-
-        // Converts a single row of VARIANTs into Arrow Scalars using the composed transformer
-        arrow::Result<std::vector<std::shared_ptr<arrow::Scalar>>> ToArrowScalars(const std::vector<VARIANT>& input) {
-            std::vector<std::shared_ptr<arrow::Scalar>> scalars;
-            for (const auto& var : input) {
-                ARROW_ASSIGN_OR_RAISE(auto scalar, transformer_.to_arrow(var));
-                scalars.push_back(std::move(scalar));
-            }
-            return scalars;
-        }
-
-        // Helper to create a record batch from a vector of rows
-        arrow::Result<std::shared_ptr<arrow::RecordBatch>> ToRecordBatch(
-            const std::vector<std::vector<VARIANT>>& rows,
-            const std::shared_ptr<arrow::Schema>& schema) {
-            std::vector<std::vector<std::shared_ptr<arrow::Scalar>>> all_scalars;
-            for (const auto& row : rows) {
-                ARROW_ASSIGN_OR_RAISE(auto scalars, ToArrowScalars(row));
-                all_scalars.push_back(std::move(scalars));
-            }
-
-            std::vector<std::shared_ptr<arrow::Array>> columns;
-            for (size_t col = 0; col < schema->num_fields(); ++col) {
-                std::vector<std::shared_ptr<arrow::Scalar>> col_scalars;
-                for (const auto& row : all_scalars) col_scalars.push_back(row[col]);
-
-                ARROW_ASSIGN_OR_RAISE(auto arr, arrow::MakeArrayFromScalars(
-                    col_scalars, schema->field(static_cast<int>(col))->type(), arrow::default_memory_pool()));
-                columns.push_back(arr);
-            }
-
-            return arrow::RecordBatch::Make(schema, static_cast<int>(rows.size()), columns);
-        }
-            return Wrapper<Transformer_>(table_, reader_, transformer_);
-        }
-
-    private:
-        std::shared_ptr<arrow::Table> table_;
-        std::shared_ptr<arrow::RecordBatchReader> reader_;
-
-        template <typename T>
-        friend class Builder;
-
-        template <typename T>
-        void set_transformer(T transformer) {
-            transformer_ = std::move(transformer);
-        }
-
-        Transformer_ transformer_;
+    auto do_put = [&](std::shared_ptr<arrow::Table> tbl) {
+        auto [writer, _] = client->DoPut(descr, tbl->schema());
+        arrow::TableBatchReader reader(*tbl);
+        reader.set_chunksize(2);
+        std::shared_ptr<arrow::RecordBatch> rb;
+        while (reader.ReadNext(&rb).ok() && rb) writer->WriteRecordBatch(*rb);
+        writer->Close();
     };
 
-    static Builder<> builder(std::shared_ptr<arrow::Table> table) {
-        return Builder<>(std::move(table));
+    // First roundtrip
+    do_put(table1);
+    auto info1 = client->GetFlightInfo(descr).ValueOrDie();
+    auto stream1 = client->DoGet(info1.endpoints()[0].ticket).ValueOrDie();
+    std::shared_ptr<arrow::Table> table2;
+    arrow::Table::FromRecordBatchReader(std::move(stream1), &table2).ValueOrDie();
+    std::cout << "After 1st roundtrip:\n" << table2->ToString() << std::endl;
+
+    // Second roundtrip
+    do_put(table2);
+    auto info2 = client->GetFlightInfo(descr).ValueOrDie();
+    auto stream2 = client->DoGet(info2.endpoints()[0].ticket).ValueOrDie();
+    auto backend = std::make_shared<StreamedBackend>(std::move(stream2));
+
+    // Compose transformer list: index columns + receive_all for extras
+    using BaseTs = TransformerList<Identity<arrow::Int32Type>, Identity<arrow::DoubleType>, Identity<arrow::BooleanType>, Identity<arrow::StringType>>;
+    auto view = TableView<StreamedBackend, BaseTs, MetadataFilter<ProcessTrueKey, ProcessTrueVal>>(backend)
+                    .addTransformer<ReceiveAllTransformer>();
+
+    std::cout << "Rows via iterator with metadata filter after 2nd roundtrip:\n";
+    for (auto row : view) {
+        // get typed columns
+        auto i = row.template get<0>();
+        auto d = row.template get<1>();
+        auto b = row.template get<2>();
+        auto s = row.template get<3>();
+        // receive_all extras
+        auto extras = row.receive_all();
+        std::cout << i << ", " << d << ", " << b << ", " << s;
+        std::cout << ", extras=" << extras.size() << std::endl;
     }
-
-    static Builder<> builder(std::shared_ptr<arrow::RecordBatchReader> reader) {
-        return Builder<>(nullptr, std::move(reader));
-    }
-};
-
-#include "ArrowTableAPI.h"
-#include <arrow/flight/api.h>
-
-arrow::Result<std::shared_ptr<arrow::Table>> FetchTableFromFlight(const std::string& host, int port) {
-    arrow::flight::Location location;
-    ARROW_ASSIGN_OR_RAISE(location, arrow::flight::Location::Parse("grpc://" + host + ":" + std::to_string(port)));
-    std::unique_ptr<arrow::flight::FlightClient> client;
-    ARROW_RETURN_NOT_OK(arrow::flight::FlightClient::Connect(location, &client));
-
-    auto descriptor = arrow::flight::FlightDescriptor::Path({"default"});
-    ARROW_ASSIGN_OR_RAISE(auto info, client->GetFlightInfo(descriptor));
-    ARROW_ASSIGN_OR_RAISE(auto stream, client->DoGet(info.endpoints()[0].ticket));
-
-    ARROW_ASSIGN_OR_RAISE(auto reader, stream->ToRecordBatchReader());
-    ARROW_ASSIGN_OR_RAISE(auto table, reader->ToTable());
-    return table;
+    return 0;
 }
 
-// Then use like:
-auto maybe_table = FetchTableFromFlight("localhost", 8815);
-if (maybe_table.ok()) {
-    auto table = maybe_table.ValueOrDie();
-    auto iter = ArrowTableAPI::builder(table)
-        | forType<arrow::Type::INT32, BasicVariant>()
-        .rowIterator();
 
-    while (auto row = iter.NextRow()) {
-        // already prints each row with wcout
-    }
-} else {
-    std::cerr << "Failed to fetch table: " << maybe_table.status().ToString() << std::endl;
-}
+import pyarrow as pa
+import pyarrow.flight as flight
+import threading
+
+class EchoFlightServer(flight.FlightServerBase):
+    def __init__(self, location):
+        super().__init__(location)
+
+    def do_put(self, context, descriptor, reader, writer):
+        # Read incoming table
+        table = reader.read_all()
+        print("Server received table:", table.schema)
+        # Echo it back under same descriptor
+        writer.begin(table.schema, descriptor)
+        # Stream by batches
+        for batch in table.to_batches():
+            writer.write_batch(batch)
+        writer.done_writing()
+
+    def do_get(self, context, ticket):
+        # Tickets carry the descriptor
+        descriptor = flight.FlightDescriptor.for_command(ticket.ticket)
+        # For simplicity, reuse last put (not production safe)
+        return flight.RecordBatchStream(self._last_table)
+
+if __name__ == '__main__':
+    server = EchoFlightServer(('localhost', 8815))
+    print('Starting Flight relay on localhost:8815')
+    threading.Thread(target=server.serve).start()
+
+import pyarrow as pa
+import pyarrow.flight as flight
+
+# Construct a table with all primitive Arrow types
+fields = [
+    pa.field('i32', pa.int32()),
+    pa.field('f64', pa.float64()),
+    pa.field('bol', pa.bool_()),
+    pa.field('str', pa.string()),
+]
+schema = pa.schema(fields)
+columns = [
+    pa.array([1, 2, 3]),
+    pa.array([0.1, 0.2, 0.3]),
+    pa.array([True, False, True]),
+    pa.array(['a', 'b', 'c']),
+]
+table = pa.Table.from_arrays(columns, schema=schema)
+
+def main():
+    client = flight.FlightClient('grpc://localhost:8815')
+    descriptor = flight.FlightDescriptor.for_command(b'my_table')
+
+    # PUT: send table in batches of 2
+    writer, _ = client.do_put(descriptor, schema)
+    for batch in table.to_batches(2):
+        writer.write_batch(batch)
+    writer.close()
+
+    # GET: retrieve back streaming row-wise
+    info = client.get_flight_info(descriptor)
+    reader = client.do_get(info.endpoints[0].ticket)
+
+    print("Batch-wise streaming:")
+    for batch in reader:
+        print(batch)
+
+    # Row-wise streaming
+    print("Row-wise streaming:")
+    for record in reader.read_table().to_batches(1):
+        for row in record.to_pydict().values():
+            print(row)
+
+if __name__ == '__main__':
+    main()
