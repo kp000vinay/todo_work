@@ -890,3 +890,369 @@ int main() {
     return 0;
 }
 
+void ReleaseObject(PyObjectId objectId) override {
+        std::lock_guard<std::mutex> lock(m_objectMutex);
+        auto it = m_objects.find(objectId);
+        if (it != m_objects.end()) {
+            Py_DECREF(it->second);
+            m_objects.erase(it);
+        }
+    }
+    
+    void ReleaseAllObjects() override {
+        std::lock_guard<std::mutex> lock(m_objectMutex);
+        for (auto& [id, obj] : m_objects) {
+            Py_DECREF(obj);
+        }
+        m_objects.clear();
+    }
+    
+    // Object operations
+    PyResult CallMethod(PyObjectId objectId, const std::string& method, 
+                        const std::vector<PyObjectId>& args) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj) {
+            PyResult result;
+            result.success = false;
+            result.error = "Invalid object ID";
+            result.objectId = INVALID_OBJECT_ID;
+            return result;
+        }
+        
+        PyObject* methodObj = PyObject_GetAttrString(obj, method.c_str());
+        if (!methodObj) {
+            return MakeResult(nullptr);
+        }
+        
+        // Convert args
+        PyObject* pyArgs = PyTuple_New(args.size());
+        for (size_t i = 0; i < args.size(); ++i) {
+            PyObject* arg = GetObject(args[i]);
+            if (!arg) {
+                Py_DECREF(pyArgs);
+                Py_DECREF(methodObj);
+                PyResult result;
+                result.success = false;
+                result.error = "Invalid argument ID at position " + std::to_string(i);
+                result.objectId = INVALID_OBJECT_ID;
+                return result;
+            }
+            Py_INCREF(arg);
+            PyTuple_SetItem(pyArgs, i, arg);
+        }
+        
+        PyObject* result = PyObject_CallObject(methodObj, pyArgs);
+        Py_DECREF(methodObj);
+        Py_DECREF(pyArgs);
+        
+        return MakeResult(result, true);
+    }
+    
+    PyResult GetAttribute(PyObjectId objectId, const std::string& attribute) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj) {
+            PyResult result;
+            result.success = false;
+            result.error = "Invalid object ID";
+            result.objectId = INVALID_OBJECT_ID;
+            return result;
+        }
+        
+        PyObject* attr = PyObject_GetAttrString(obj, attribute.c_str());
+        return MakeResult(attr, true);
+    }
+    
+    PyResult SetAttribute(PyObjectId objectId, const std::string& attribute, 
+                          PyObjectId valueId) override {
+        PyObject* obj = GetObject(objectId);
+        PyObject* value = GetObject(valueId);
+        
+        if (!obj || !value) {
+            PyResult result;
+            result.success = false;
+            result.error = "Invalid object or value ID";
+            result.objectId = INVALID_OBJECT_ID;
+            return result;
+        }
+        
+        if (PyObject_SetAttrString(obj, attribute.c_str(), value) == 0) {
+            PyResult result;
+            result.success = true;
+            result.objectId = valueId;
+            return result;
+        }
+        
+        return MakeResult(nullptr);
+    }
+    
+    PyResult GetItem(PyObjectId objectId, PyObjectId keyId) override {
+        PyObject* obj = GetObject(objectId);
+        PyObject* key = GetObject(keyId);
+        
+        if (!obj || !key) {
+            PyResult result;
+            result.success = false;
+            result.error = "Invalid object or key ID";
+            result.objectId = INVALID_OBJECT_ID;
+            return result;
+        }
+        
+        PyObject* item = PyObject_GetItem(obj, key);
+        return MakeResult(item, true);
+    }
+    
+    PyResult SetItem(PyObjectId objectId, PyObjectId keyId, PyObjectId valueId) override {
+        PyObject* obj = GetObject(objectId);
+        PyObject* key = GetObject(keyId);
+        PyObject* value = GetObject(valueId);
+        
+        if (!obj || !key || !value) {
+            PyResult result;
+            result.success = false;
+            result.error = "Invalid object, key, or value ID";
+            result.objectId = INVALID_OBJECT_ID;
+            return result;
+        }
+        
+        if (PyObject_SetItem(obj, key, value) == 0) {
+            PyResult result;
+            result.success = true;
+            result.objectId = valueId;
+            return result;
+        }
+        
+        return MakeResult(nullptr);
+    }
+    
+    // Type creation
+    PyResult CreateInt(int64_t value) override {
+        PyObject* obj = PyLong_FromLongLong(value);
+        return MakeResult(obj, true);
+    }
+    
+    PyResult CreateFloat(double value) override {
+        PyObject* obj = PyFloat_FromDouble(value);
+        return MakeResult(obj, true);
+    }
+    
+    PyResult CreateString(const std::string& value) override {
+        PyObject* obj = PyUnicode_FromString(value.c_str());
+        return MakeResult(obj, true);
+    }
+    
+    PyResult CreateBool(bool value) override {
+        PyObject* obj = value ? Py_True : Py_False;
+        Py_INCREF(obj);
+        return MakeResult(obj, true);
+    }
+    
+    PyResult CreateList(const std::vector<PyObjectId>& items) override {
+        PyObject* list = PyList_New(items.size());
+        for (size_t i = 0; i < items.size(); ++i) {
+            PyObject* item = GetObject(items[i]);
+            if (!item) {
+                Py_DECREF(list);
+                PyResult result;
+                result.success = false;
+                result.error = "Invalid item ID at position " + std::to_string(i);
+                result.objectId = INVALID_OBJECT_ID;
+                return result;
+            }
+            Py_INCREF(item);
+            PyList_SetItem(list, i, item);
+        }
+        return MakeResult(list, true);
+    }
+    
+    PyResult CreateDict(const std::map<PyObjectId, PyObjectId>& items) override {
+        PyObject* dict = PyDict_New();
+        for (const auto& [keyId, valueId] : items) {
+            PyObject* key = GetObject(keyId);
+            PyObject* value = GetObject(valueId);
+            if (!key || !value) {
+                Py_DECREF(dict);
+                PyResult result;
+                result.success = false;
+                result.error = "Invalid key or value ID";
+                result.objectId = INVALID_OBJECT_ID;
+                return result;
+            }
+            PyDict_SetItem(dict, key, value);
+        }
+        return MakeResult(dict, true);
+    }
+    
+    // Type extraction
+    std::optional<int64_t> AsInt(PyObjectId objectId) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj || !PyLong_Check(obj)) return std::nullopt;
+        return PyLong_AsLongLong(obj);
+    }
+    
+    std::optional<double> AsFloat(PyObjectId objectId) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj) return std::nullopt;
+        if (PyFloat_Check(obj)) return PyFloat_AsDouble(obj);
+        if (PyLong_Check(obj)) return (double)PyLong_AsLongLong(obj);
+        return std::nullopt;
+    }
+    
+    std::optional<std::string> AsString(PyObjectId objectId) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj) return std::nullopt;
+        
+        if (PyUnicode_Check(obj)) {
+            const char* str = PyUnicode_AsUTF8(obj);
+            return str ? std::string(str) : std::nullopt;
+        }
+        
+        // Try to convert to string
+        PyObject* strObj = PyObject_Str(obj);
+        if (strObj) {
+            const char* str = PyUnicode_AsUTF8(strObj);
+            std::string result = str ? str : "";
+            Py_DECREF(strObj);
+            return result;
+        }
+        
+        return std::nullopt;
+    }
+    
+    std::optional<bool> AsBool(PyObjectId objectId) override {
+        PyObject* obj = GetObject(objectId);
+        if (!obj) return std::nullopt;
+        
+        int truth = PyObject_IsTrue(obj);
+        if (truth == -1) {
+            PyErr_Clear();
+            return std::nullopt;
+        }
+        return truth == 1;
+    }
+    
+    // Introspection
+    PyObjectInfo GetObjectInfo(PyObjectId objectId) override {
+        PyObjectInfo info;
+        info.id = objectId;
+        
+        PyObject* obj = GetObject(objectId);
+        if (!obj) {
+            info.type = "invalid";
+            return info;
+        }
+        
+        // Get type name
+        PyObject* typeObj = PyObject_Type(obj);
+        if (typeObj) {
+            PyObject* typeName = PyObject_GetAttrString(typeObj, "__name__");
+            if (typeName && PyUnicode_Check(typeName)) {
+                info.type = PyUnicode_AsUTF8(typeName);
+                Py_XDECREF(typeName);
+            }
+            Py_DECREF(typeObj);
+        }
+        
+        // Get repr
+        PyObject* repr = PyObject_Repr(obj);
+        if (repr) {
+            info.repr = PyUnicode_AsUTF8(repr);
+            Py_DECREF(repr);
+        }
+        
+        // Get attributes
+        PyObject* dir = PyObject_Dir(obj);
+        if (dir && PyList_Check(dir)) {
+            Py_ssize_t size = PyList_Size(dir);
+            for (Py_ssize_t i = 0; i < size; ++i) {
+                PyObject* attr = PyList_GetItem(dir, i);
+                if (PyUnicode_Check(attr)) {
+                    info.attributes.push_back(PyUnicode_AsUTF8(attr));
+                }
+            }
+            Py_DECREF(dir);
+        }
+        
+        info.refCount = Py_REFCNT(obj);
+        return info;
+    }
+    
+    std::vector<std::string> GetGlobalNames() override {
+        std::vector<std::string> names;
+        
+        PyObject* keys = PyDict_Keys(m_globalDict);
+        if (keys) {
+            Py_ssize_t size = PyList_Size(keys);
+            for (Py_ssize_t i = 0; i < size; ++i) {
+                PyObject* key = PyList_GetItem(keys, i);
+                if (PyUnicode_Check(key)) {
+                    const char* name = PyUnicode_AsUTF8(key);
+                    if (name && name[0] != '_') {  // Skip private names
+                        names.push_back(name);
+                    }
+                }
+            }
+            Py_DECREF(keys);
+        }
+        
+        return names;
+    }
+    
+    // Module operations
+    PyResult ImportModule(const std::string& moduleName) override {
+        PyObject* module = PyImport_ImportModule(moduleName.c_str());
+        return MakeResult(module, true);
+    }
+    
+    bool IsModuleLoaded(const std::string& moduleName) override {
+        PyObject* modules = PyImport_GetModuleDict();
+        PyObject* module = PyDict_GetItemString(modules, moduleName.c_str());
+        return module != nullptr;
+    }
+    
+private:
+    std::string GetPythonError() {
+        PyObject *type, *value, *traceback;
+        PyErr_Fetch(&type, &value, &traceback);
+        
+        std::string error = "Python error: ";
+        
+        if (value) {
+            PyObject* str = PyObject_Str(value);
+            if (str) {
+                const char* text = PyUnicode_AsUTF8(str);
+                if (text) {
+                    error += text;
+                }
+                Py_DECREF(str);
+            }
+        }
+        
+        PyErr_Clear();
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(traceback);
+        
+        return error;
+    }
+};
+
+// Export function for creating bridge instance
+extern "C" __declspec(dllexport) IPythonBridge* CreatePythonBridge() {
+    return new PythonBridge();
+}
+
+// Python module initialization (required for .pyd)
+static PyMethodDef module_methods[] = {
+    {nullptr, nullptr, 0, nullptr}
+};
+
+static struct PyModuleDef module_def = {
+    PyModuleDef_HEAD_INIT,
+    "pythonbridge",
+    "Python bridge module for embedding with object storage",
+    -1,
+    module_methods
+};
+
+extern "C" __declspec(dllexport) PyObject* PyInit_pythonbridge() {
+    return PyModule_Create(&module_def);
