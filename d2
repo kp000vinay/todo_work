@@ -1,0 +1,1035 @@
+// ThreadSafePythonEnvironment.h - Complete implementation with ThreadStateManager
+#pragma once
+
+#include "PythonEnvironmentImpl.h"
+#include "PythonThreadStateManager_Complete.h"
+#include <future>
+#include <chrono>
+
+class ThreadSafePythonEnvironment : public PythonEnvironment {
+private:
+    // Thread state management
+    PythonThreadStateManager* m_threadStateManager;
+    
+    // Enhanced state tracking
+    std::atomic<int> m_activeOperations{0};
+    std::condition_variable m_operationsCv;
+    std::mutex m_operationsMutex;
+    
+    // Thread tracking
+    std::thread::id m_initializingThread;
+    HANDLE m_initializingThreadHandle = nullptr;
+    
+    // Finalization tracking
+    std::atomic<bool> m_finalizationRequested{false};
+    std::condition_variable m_finalizationCv;
+    std::mutex m_finalizationMutex;
+    
+    // Enhanced Python function pointers (in addition to base class)
+    struct EnhancedPythonAPI {
+        PyThreadState* (*PyThreadState_Get)(void) = nullptr;
+        PyThreadState* (*PyThreadState_Swap)(PyThreadState*) = nullptr;
+        void (*PyEval_RestoreThread)(PyThreadState*) = nullptr;
+        PyThreadState* (*PyEval_SaveThread)(void) = nullptr;
+        int (*PyGILState_Ensure)(void) = nullptr;
+        void (*PyGILState_Release)(int) = nullptr;
+        int (*PyGILState_Check)(void) = nullptr;
+        void (*PyErr_Clear)(void) = nullptr;
+        int (*PyRun_SimpleString)(const char*) = nullptr;
+        
+        bool LoadFromDll(HMODULE pythonDll) {
+            if (!pythonDll) return false;
+            
+            #define LOAD_FUNC(name) \
+                name = (decltype(name))GetProcAddress(pythonDll, #name)
+            
+            LOAD_FUNC(PyThreadState_Get);
+            LOAD_FUNC(PyThreadState_Swap);
+            LOAD_FUNC(PyEval_RestoreThread);
+            LOAD_FUNC(PyEval_SaveThread);
+            LOAD_FUNC(PyGILState_Ensure);
+            LOAD_FUNC(PyGILState_Release);
+            LOAD_FUNC(PyGILState_Check);
+            LOAD_FUNC(PyErr_Clear);
+            LOAD_FUNC(PyRun_SimpleString);
+            
+            #undef LOAD_FUNC
+            
+            return true;
+        }
+    } m_enhancedApi;
+    
+    // Finalization strategy
+    enum class FinalizationStrategy {
+        SameThread,           // Finalize on initialization thread
+        ThreadStateSwap,      // Use PyThreadState_Swap
+        QueueToOriginal,      // Queue APC to original thread
+        ForceWithGIL          // Force with GIL acquisition
+    };
+    
+public:
+    ThreadSafePythonEnvironment(const std::string& condaPath)
+        : PythonEnvironment(condaPath) {
+        // Use global thread state manager
+        m_threadStateManager = &GetGlobalThreadStateManager();
+    }
+    
+    ~ThreadSafePythonEnvironment() {
+        OptimalShutdown();
+    }
+    
+    // Thread-safe Python execution with operation tracking
+    template<typename Func>
+    auto ExecutePythonSafely(Func&& func) -> decltype(func()) {
+        // Track active operations
+        {
+            std::lock_guard<std::mutex> lock(m_operationsMutex);
+            m_activeOperations++;
+        }
+        
+        // Ensure cleanup on scope exit
+        auto cleanup = [this]() {
+            std::lock_guard<std::mutex> lock(m_operationsMutex);
+            m_activeOperations--;
+            m_operationsCv.notify_all();
+        };
+        
+        struct ScopeGuard {
+            std::function<void()> f;
+            ~ScopeGuard() { if (f) f(); }
+        } guard{cleanup};
+        
+        // Execute on appropriate thread
+        return m_threadStateManager->ExecuteOnPythonThread(std::forward<Func>(func));
+    }
+    
+    // Register a thread for Python usage
+    bool RegisterThreadForPython(const std::string& threadName = "") {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        if (!m_initialized || !m_threadStateManager) {
+            m_lastError = "Environment not initialized";
+            return false;
+        }
+        
+        // Set thread name if provided
+        if (!threadName.empty()) {
+            SetThreadDescription(GetCurrentThread(), 
+                               std::wstring(threadName.begin(), threadName.end()).c_str());
+        }
+        
+        // Capture thread state
+        if (!m_threadStateManager->CaptureCurrentThreadState(false)) {
+            m_lastError = "Failed to capture thread state";
+            return false;
+        }
+        
+        LogDebug("Registered thread: " + threadName);
+        return true;
+    }
+    
+    // Get optimal finalization strategy
+    FinalizationStrategy DetermineFinalizationStrategy() const {
+        auto currentThread = std::this_thread::get_id();
+        
+        // Check if we're on the initializing thread
+        if (currentThread == m_initializingThread) {
+            return FinalizationStrategy::SameThread;
+        }
+        
+        // Check if current thread has Python state
+        auto threadInfo = m_threadStateManager->GetThreadStateInfo(currentThread);
+        if (threadInfo && threadInfo->pyThreadState) {
+            return FinalizationStrategy::ThreadStateSwap;
+        }
+        
+        // Check if we can queue to original thread
+        auto mainInfo = m_threadStateManager->GetThreadStateInfo(m_initializingThread);
+        if (mainInfo && mainInfo->threadHandle) {
+            // Check if thread is still alive
+            DWORD exitCode;
+            if (GetExitCodeThread(mainInfo->threadHandle, &exitCode) && exitCode == STILL_ACTIVE) {
+                return FinalizationStrategy::QueueToOriginal;
+            }
+        }
+        
+        // Last resort
+        return FinalizationStrategy::ForceWithGIL;
+    }
+    
+    // Get initialization thread info
+    std::string GetInitializationInfo() const {
+        std::stringstream ss;
+        ss << "Initialized on thread: " << m_initializingThread;
+        ss << ", Current thread: " << std::this_thread::get_id();
+        ss << ", Strategy: " << GetStrategyName(DetermineFinalizationStrategy());
+        return ss.str();
+    }
+    
+protected:
+    bool InitializePython() override {
+        // First initialize thread state manager with Python DLL
+        if (m_pythonDll && !m_threadStateManager->Initialize(m_pythonDll)) {
+            m_lastError = "Failed to initialize thread state manager";
+            return false;
+        }
+        
+        // Load enhanced API functions
+        m_enhancedApi.LoadFromDll(m_pythonDll);
+        
+        // Record the initializing thread
+        m_initializingThread = std::this_thread::get_id();
+        m_initializingThreadHandle = OpenThread(THREAD_ALL_ACCESS, FALSE, GetCurrentThreadId());
+        
+        // Call base initialization
+        if (!PythonEnvironment::InitializePython()) {
+            return false;
+        }
+        
+        // Capture thread state immediately after initialization
+        if (!m_threadStateManager->CaptureCurrentThreadState(true)) {
+            m_lastError = "Failed to capture main thread state";
+            return false;
+        }
+        
+        LogDebug("Python initialized on thread " + std::to_string(GetCurrentThreadId()));
+        
+        // Set up thread state for all threads that will use Python
+        SetupThreadStateHooks();
+        
+        return true;
+    }
+    
+    void Shutdown() override {
+        OptimalShutdown();
+    }
+    
+private:
+    void OptimalShutdown() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        if (!m_initialized || m_finalizationRequested.exchange(true)) {
+            return;
+        }
+        
+        LogDebug("Starting optimal shutdown");
+        
+        // Wait for active operations to complete
+        WaitForActiveOperations();
+        
+        // Release bridge first (safe from any thread)
+        m_bridge.reset();
+        
+        // Only finalize Python if we own the interpreter
+        if (m_ownsInterpreter && m_pyFuncs.Py_Finalize && 
+            m_pyFuncs.Py_IsInitialized && m_pyFuncs.Py_IsInitialized()) {
+            
+            // Determine best finalization strategy
+            auto strategy = DetermineFinalizationStrategy();
+            LogDebug("Finalization strategy: " + GetStrategyName(strategy));
+            
+            // Perform finalization based on strategy
+            bool finalized = false;
+            
+            try {
+                switch (strategy) {
+                    case FinalizationStrategy::SameThread:
+                        finalized = FinalizeSameThread();
+                        break;
+                        
+                    case FinalizationStrategy::ThreadStateSwap:
+                        finalized = FinalizeWithThreadStateSwap();
+                        break;
+                        
+                    case FinalizationStrategy::QueueToOriginal:
+                        finalized = FinalizeQueueToOriginal();
+                        break;
+                        
+                    case FinalizationStrategy::ForceWithGIL:
+                        finalized = FinalizeForceWithGIL();
+                        break;
+                }
+            } catch (const std::exception& e) {
+                LogError("Exception during finalization: " + std::string(e.what()));
+                finalized = false;
+            }
+            
+            if (!finalized) {
+                LogError("Failed to finalize Python properly");
+            } else {
+                LogDebug("Python finalized successfully");
+            }
+        }
+        
+        // Clean up thread states
+        if (m_threadStateManager) {
+            m_threadStateManager->ShutdownAllThreadStates();
+        }
+        
+        // Unload modules (safe from any thread)
+        if (m_bridgeDll) {
+            FreeLibrary(m_bridgeDll);
+            m_bridgeDll = nullptr;
+        }
+        
+        if (m_pythonDll) {
+            FreeLibrary(m_pythonDll);
+            m_pythonDll = nullptr;
+        }
+        
+        // Clean up thread handle
+        if (m_initializingThreadHandle) {
+            CloseHandle(m_initializingThreadHandle);
+            m_initializingThreadHandle = nullptr;
+        }
+        
+        m_initialized = false;
+        m_ownsInterpreter = false;
+        m_environmentInfo["initialized"] = "false";
+    }
+    
+    void WaitForActiveOperations() {
+        std::unique_lock<std::mutex> lock(m_operationsMutex);
+        
+        auto timeout = std::chrono::seconds(30);
+        auto start = std::chrono::steady_clock::now();
+        
+        while (m_activeOperations > 0) {
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed > timeout) {
+                LogError("Timeout waiting for active operations to complete. Count: " + 
+                        std::to_string(m_activeOperations.load()));
+                break;
+            }
+            
+            m_operationsCv.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        
+        if (m_activeOperations == 0) {
+            LogDebug("All operations completed");
+        }
+    }
+    
+    bool FinalizeSameThread() {
+        LogDebug("Finalizing on same thread");
+        
+        // Simple case - we're on the right thread
+        return m_threadStateManager->FinalizeWithThreadState([this]() {
+            if (m_pyFuncs.Py_FinalizeEx) {
+                int result = m_pyFuncs.Py_FinalizeEx();
+                if (result < 0) {
+                    LogError("Py_FinalizeEx returned error code: " + std::to_string(result));
+                    throw std::runtime_error("Py_FinalizeEx failed");
+                }
+            } else {
+                m_pyFuncs.Py_Finalize();
+            }
+        });
+    }
+    
+    bool FinalizeWithThreadStateSwap() {
+        LogDebug("Using thread state swap for finalization");
+        
+        return m_threadStateManager->FinalizeWithThreadState([this]() {
+            // The thread state manager handles the swap
+            if (m_pyFuncs.Py_FinalizeEx) {
+                int result = m_pyFuncs.Py_FinalizeEx();
+                if (result < 0) {
+                    throw std::runtime_error("Py_FinalizeEx failed");
+                }
+            } else {
+                m_pyFuncs.Py_Finalize();
+            }
+        });
+    }
+    
+    bool FinalizeQueueToOriginal() {
+        LogDebug("Queueing finalization to original thread");
+        
+        auto mainInfo = m_threadStateManager->GetThreadStateInfo(m_initializingThread);
+        if (!mainInfo || !mainInfo->threadHandle) {
+            LogError("Main thread info not available");
+            return false;
+        }
+        
+        struct FinalizationContext {
+            ThreadSafePythonEnvironment* env;
+            std::atomic<bool> completed{false};
+            std::atomic<bool> success{false};
+            std::exception_ptr exception;
+        };
+        
+        auto context = std::make_shared<FinalizationContext>();
+        context->env = this;
+        
+        auto apcFunc = [](ULONG_PTR param) -> void {
+            auto ctx = reinterpret_cast<FinalizationContext*>(param);
+            try {
+                ctx->success = ctx->env->FinalizeSameThread();
+                ctx->completed = true;
+            } catch (...) {
+                ctx->exception = std::current_exception();
+                ctx->completed = true;
+            }
+        };
+        
+        DWORD result = QueueUserAPC(apcFunc, mainInfo->threadHandle, 
+                                   reinterpret_cast<ULONG_PTR>(context.get()));
+        
+        if (!result) {
+            DWORD error = GetLastError();
+            LogError("QueueUserAPC failed with error: " + std::to_string(error));
+            return false;
+        }
+        
+        // Wait for completion with timeout
+        auto start = std::chrono::steady_clock::now();
+        while (!context->completed) {
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed > std::chrono::seconds(10)) {
+                LogError("Timeout waiting for queued finalization");
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        if (context->exception) {
+            try {
+                std::rethrow_exception(context->exception);
+            } catch (const std::exception& e) {
+                LogError("Exception during queued finalization: " + std::string(e.what()));
+            }
+            return false;
+        }
+        
+        return context->success;
+    }
+    
+    bool FinalizeForceWithGIL() {
+        LogWarning("Forcing finalization with GIL acquisition - this may be unsafe");
+        
+        // Last resort - try to make it as safe as possible
+        if (m_enhancedApi.PyGILState_Ensure && m_enhancedApi.PyGILState_Release) {
+            int gilState = m_enhancedApi.PyGILState_Ensure();
+            
+            // Clear any pending errors
+            if (m_enhancedApi.PyErr_Clear) {
+                m_enhancedApi.PyErr_Clear();
+            }
+            
+            // Try to stop all Python threads gracefully
+            if (m_enhancedApi.PyRun_SimpleString) {
+                const char* stopThreadsCode = R"(
+import threading
+import time
+import sys
+
+# Get all threads except main
+threads = [t for t in threading.enumerate() if t != threading.main_thread()]
+
+# Request threads to stop
+for t in threads:
+    if hasattr(t, 'stop'):
+        t.stop()
+
+# Wait briefly for threads to stop
+for t in threads:
+    t.join(timeout=0.5)
+
+# Force cleanup
+import gc
+gc.collect()
+)";
+                
+                m_enhancedApi.PyRun_SimpleString(stopThreadsCode);
+            }
+            
+            m_enhancedApi.PyGILState_Release(gilState);
+            
+            // Give threads time to finish
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        
+        // Finalize
+        bool success = true;
+        if (m_pyFuncs.Py_FinalizeEx) {
+            int result = m_pyFuncs.Py_FinalizeEx();
+            if (result < 0) {
+                LogError("Py_FinalizeEx returned error during forced finalization");
+                success = false;
+            }
+        } else {
+            m_pyFuncs.Py_Finalize();
+        }
+        
+        return success;
+    }
+    
+    void SetupThreadStateHooks() {
+        // This could be extended to automatically capture thread state
+        // when new threads first call into Python
+        
+        // For now, threads must explicitly register
+        LogDebug("Thread state hooks ready - threads must call RegisterThreadForPython()");
+    }
+    
+    std::string GetStrategyName(FinalizationStrategy strategy) const {
+        switch (strategy) {
+            case FinalizationStrategy::SameThread: return "SameThread";
+            case FinalizationStrategy::ThreadStateSwap: return "ThreadStateSwap";
+            case FinalizationStrategy::QueueToOriginal: return "QueueToOriginal";
+            case FinalizationStrategy::ForceWithGIL: return "ForceWithGIL";
+            default: return "Unknown";
+        }
+    }
+    
+    void LogDebug(const std::string& message) {
+        #ifdef _DEBUG
+        std::cout << "[DEBUG][Thread:" << std::this_thread::get_id() << "] " 
+                  << message << std::endl;
+        #endif
+    }
+    
+    void LogWarning(const std::string& message) {
+        std::cerr << "[WARNING][Thread:" << std::this_thread::get_id() << "] " 
+                  << message << std::endl;
+    }
+    
+    void LogError(const std::string& message) {
+        std::cerr << "[ERROR][Thread:" << std::this_thread::get_id() << "] " 
+                  << message << std::endl;
+        m_lastError = message;
+    }
+};
+
+// Thread-safe environment manager
+class ThreadSafePythonEnvironmentManager : public IPythonEnvironmentManager {
+private:
+    std::unordered_map<std::string, std::shared_ptr<ThreadSafePythonEnvironment>> m_environments;
+    mutable std::mutex m_mutex;
+    std::atomic<bool> m_shutdownInProgress{false};
+    
+public:
+    ~ThreadSafePythonEnvironmentManager() {
+        ShutdownAll();
+    }
+    
+    std::shared_ptr<IPythonEnvironment> GetEnvironment(const std::string& condaPath) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        if (m_shutdownInProgress) {
+            return nullptr;
+        }
+        
+        // Normalize path
+        fs::path normalizedPath;
+        try {
+            normalizedPath = fs::absolute(condaPath);
+        } catch (const std::exception&) {
+            return nullptr;
+        }
+        
+        std::string key = normalizedPath.string();
+        
+        // Check if already exists
+        auto it = m_environments.find(key);
+        if (it != m_environments.end()) {
+            return it->second;
+        }
+        
+        // Create new thread-safe environment
+        auto env = std::make_shared<ThreadSafePythonEnvironment>(key);
+        m_environments[key] = env;
+        
+        return env;
+    }
+    
+    std::vector<std::string> GetActiveEnvironments() const override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        std::vector<std::string> paths;
+        paths.reserve(m_environments.size());
+        
+        for (const auto& [path, env] : m_environments) {
+            if (env && env->IsInitialized()) {
+                paths.push_back(path);
+            }
+        }
+        
+        return paths;
+    }
+    
+    void ShutdownEnvironment(const std::string& condaPath) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        fs::path normalizedPath;
+        try {
+            normalizedPath = fs::absolute(condaPath);
+        } catch (const std::exception&) {
+            return;
+        }
+        
+        std::string key = normalizedPath.string();
+        
+        auto it = m_environments.find(key);
+        if (it != m_environments.end()) {
+            if (it->second) {
+                it->second->Shutdown();
+            }
+            m_environments.erase(it);
+        }
+    }
+    
+    void ShutdownAll() override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        m_shutdownInProgress = true;
+        
+        // Shutdown all environments
+        for (auto& [path, env] : m_environments) {
+            if (env) {
+                std::cout << "Shutting down environment: " << path << std::endl;
+                std::cout << "  " << env->GetInitializationInfo() << std::endl;
+                env->Shutdown();
+            }
+        }
+        
+        m_environments.clear();
+    }
+    
+    void RegisterBridgeFactory(const std::string& pythonVersion, 
+                               BridgeFactoryFunc factory) override {
+        // This functionality could be extended to support dynamic bridge loading
+        // For now, we rely on the pythonbridge.pyd in each environment
+    }
+};
+
+// Factory function for thread-safe manager
+extern "C" {
+    PYENV_API IPythonEnvironmentManager* CreateThreadSafePythonEnvironmentManager() {
+        return new ThreadSafePythonEnvironmentManager();
+    }
+    
+    PYENV_API void DestroyThreadSafePythonEnvironmentManager(IPythonEnvironmentManager* manager) {
+        delete manager;
+    }
+}
+
+//=====================
+
+// ThreadSafePythonUsage.cpp - Usage examples for ThreadSafePythonEnvironment
+#include "ThreadSafePythonEnvironment.h"
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <future>
+
+class ThreadSafePythonUsageExamples {
+public:
+    // Example 1: Basic thread-safe usage
+    static void BasicUsage() {
+        std::cout << "\n=== Basic Thread-Safe Usage ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\test"));
+        
+        // Initialize on main thread
+        if (!env->Initialize()) {
+            std::cerr << "Failed to initialize: " << env->GetLastError() << std::endl;
+            return;
+        }
+        
+        std::cout << "Initialization info: " << env->GetInitializationInfo() << std::endl;
+        
+        // Use from same thread - optimal
+        auto bridge = env->GetBridge();
+        bridge->ExecuteString("print('Hello from main thread')");
+        
+        // Create worker thread
+        std::thread worker([env]() {
+            // Register this thread for Python usage
+            if (!env->RegisterThreadForPython("Worker1")) {
+                std::cerr << "Failed to register thread" << std::endl;
+                return;
+            }
+            
+            // Now safe to use Python
+            env->ExecutePythonSafely([&]() {
+                auto bridge = env->GetBridge();
+                bridge->ExecuteString("print('Hello from worker thread')");
+                return true;
+            });
+        });
+        
+        worker.join();
+        
+        // Shutdown will use optimal strategy
+        std::cout << "Shutdown strategy: " 
+                  << env->GetStrategyName(env->DetermineFinalizationStrategy()) 
+                  << std::endl;
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+    
+    // Example 2: Multi-threaded data processing
+    static void MultiThreadedProcessing() {
+        std::cout << "\n=== Multi-Threaded Data Processing ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\data"));
+        
+        if (!env->Initialize()) {
+            std::cerr << "Failed to initialize" << std::endl;
+            return;
+        }
+        
+        // Prepare data in Python
+        env->GetBridge()->ExecuteString(R"(
+            import numpy as np
+            
+            # Create shared data
+            data_chunks = [np.random.rand(1000, 1000) for _ in range(4)]
+            results = {}
+        )");
+        
+        // Process chunks in parallel
+        std::vector<std::future<double>> futures;
+        
+        for (int i = 0; i < 4; ++i) {
+            futures.push_back(std::async(std::launch::async, [env, i]() {
+                // Register thread
+                env->RegisterThreadForPython("DataProcessor" + std::to_string(i));
+                
+                // Process chunk safely
+                return env->ExecutePythonSafely([&]() -> double {
+                    auto bridge = env->GetBridge();
+                    
+                    // Process data chunk
+                    std::string code = R"(
+                        chunk = data_chunks[)" + std::to_string(i) + R"(]
+                        result = np.mean(chunk) * np.std(chunk)
+                        results[)" + std::to_string(i) + R"(] = result
+                        result
+                    )";
+                    
+                    auto execResult = bridge->ExecuteString(code);
+                    if (!execResult.success) {
+                        throw std::runtime_error("Python execution failed");
+                    }
+                    
+                    // Get result
+                    auto resultObj = bridge->GetObject("result");
+                    if (!resultObj.success) {
+                        throw std::runtime_error("Failed to get result");
+                    }
+                    
+                    auto value = bridge->AsFloat(resultObj.objectId);
+                    bridge->ReleaseObject(resultObj.objectId);
+                    
+                    return value.value_or(0.0);
+                });
+            }));
+        }
+        
+        // Collect results
+        double total = 0.0;
+        for (auto& future : futures) {
+            try {
+                total += future.get();
+                std::cout << "Chunk processed successfully" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Error processing chunk: " << e.what() << std::endl;
+            }
+        }
+        
+        std::cout << "Total result: " << total << std::endl;
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+    
+    // Example 3: Handling cross-thread finalization
+    static void CrossThreadFinalization() {
+        std::cout << "\n=== Cross-Thread Finalization ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        std::shared_ptr<ThreadSafePythonEnvironment> env;
+        
+        // Initialize in a separate thread
+        std::thread initThread([&env, &manager]() {
+            env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+                manager->GetEnvironment("C:\\Python\\envs\\cross"));
+            
+            if (!env->Initialize()) {
+                std::cerr << "Failed to initialize" << std::endl;
+                return;
+            }
+            
+            std::cout << "Initialized on thread: " << std::this_thread::get_id() << std::endl;
+            
+            // Do some work
+            env->GetBridge()->ExecuteString("print('Initialized in thread')");
+        });
+        
+        initThread.join();
+        
+        // Now try to finalize from main thread
+        std::cout << "Finalizing from different thread: " << std::this_thread::get_id() << std::endl;
+        std::cout << "Strategy: " << env->GetStrategyName(env->DetermineFinalizationStrategy()) << std::endl;
+        
+        // This will handle cross-thread finalization safely
+        env->Shutdown();
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+    
+    // Example 4: Thread pool with Python
+    static void ThreadPoolExample() {
+        std::cout << "\n=== Thread Pool Example ===" << std::endl;
+        
+        class PythonThreadPool {
+            std::vector<std::thread> m_workers;
+            std::queue<std::function<void()>> m_tasks;
+            std::mutex m_queueMutex;
+            std::condition_variable m_condition;
+            std::atomic<bool> m_stop{false};
+            std::shared_ptr<ThreadSafePythonEnvironment> m_env;
+            
+            void WorkerThread(int id) {
+                // Register thread once
+                m_env->RegisterThreadForPython("PoolWorker" + std::to_string(id));
+                
+                while (true) {
+                    std::function<void()> task;
+                    
+                    {
+                        std::unique_lock<std::mutex> lock(m_queueMutex);
+                        m_condition.wait(lock, [this] { return m_stop || !m_tasks.empty(); });
+                        
+                        if (m_stop && m_tasks.empty()) {
+                            return;
+                        }
+                        
+                        task = std::move(m_tasks.front());
+                        m_tasks.pop();
+                    }
+                    
+                    // Execute task with Python safety
+                    m_env->ExecutePythonSafely([&task]() {
+                        task();
+                        return true;
+                    });
+                }
+            }
+            
+        public:
+            PythonThreadPool(std::shared_ptr<ThreadSafePythonEnvironment> env, size_t threads) 
+                : m_env(env) {
+                
+                for (size_t i = 0; i < threads; ++i) {
+                    m_workers.emplace_back(&PythonThreadPool::WorkerThread, this, i);
+                }
+            }
+            
+            ~PythonThreadPool() {
+                {
+                    std::unique_lock<std::mutex> lock(m_queueMutex);
+                    m_stop = true;
+                }
+                
+                m_condition.notify_all();
+                
+                for (auto& worker : m_workers) {
+                    worker.join();
+                }
+            }
+            
+            template<typename F>
+            void Submit(F&& f) {
+                {
+                    std::unique_lock<std::mutex> lock(m_queueMutex);
+                    m_tasks.emplace(std::forward<F>(f));
+                }
+                m_condition.notify_one();
+            }
+        };
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\pool"));
+        
+        if (!env->Initialize()) {
+            std::cerr << "Failed to initialize" << std::endl;
+            return;
+        }
+        
+        // Create thread pool
+        PythonThreadPool pool(env, 4);
+        
+        // Submit Python tasks
+        std::vector<std::future<int>> results;
+        
+        for (int i = 0; i < 10; ++i) {
+            auto promise = std::make_shared<std::promise<int>>();
+            results.push_back(promise->get_future());
+            
+            pool.Submit([env, i, promise]() {
+                try {
+                    auto bridge = env->GetBridge();
+                    
+                    std::string code = "result = " + std::to_string(i) + " ** 2";
+                    bridge->ExecuteString(code);
+                    
+                    auto resultObj = bridge->GetObject("result");
+                    auto value = bridge->AsInt(resultObj.objectId);
+                    bridge->ReleaseObject(resultObj.objectId);
+                    
+                    promise->set_value(value.value_or(-1));
+                } catch (...) {
+                    promise->set_exception(std::current_exception());
+                }
+            });
+        }
+        
+        // Get results
+        for (size_t i = 0; i < results.size(); ++i) {
+            try {
+                int result = results[i].get();
+                std::cout << "Task " << i << " result: " << result << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "Task " << i << " failed: " << e.what() << std::endl;
+            }
+        }
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+    
+    // Example 5: Debugging thread states
+    static void DebugThreadStates() {
+        std::cout << "\n=== Debug Thread States ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\debug"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        // Create multiple threads with different patterns
+        std::vector<std::thread> threads;
+        
+        // Thread that registers but doesn't use Python
+        threads.emplace_back([env]() {
+            env->RegisterThreadForPython("RegisteredUnused");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        });
+        
+        // Thread that uses Python actively
+        threads.emplace_back([env]() {
+            env->RegisterThreadForPython("ActiveUser");
+            
+            for (int i = 0; i < 5; ++i) {
+                env->ExecutePythonSafely([&]() {
+                    env->GetBridge()->ExecuteString("import time; time.sleep(0.1)");
+                    return true;
+                });
+            }
+        });
+        
+        // Thread that doesn't register (will fail)
+        threads.emplace_back([env]() {
+            try {
+                auto bridge = env->GetBridge();
+                bridge->ExecuteString("print('This should fail')");
+            } catch (const std::exception& e) {
+                std::cout << "Expected error for unregistered thread: " << e.what() << std::endl;
+            }
+        });
+        
+        // Let threads run
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        
+        // Dump thread states
+        std::cout << "\nCurrent thread states:" << std::endl;
+        GetGlobalThreadStateManager().DumpThreadStates(std::cout);
+        
+        // Wait for threads
+        for (auto& t : threads) {
+            t.join();
+        }
+        
+        // Show final state
+        std::cout << "\nFinal thread states:" << std::endl;
+        GetGlobalThreadStateManager().DumpThreadStates(std::cout);
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+    
+    // Example 6: Recovery from errors
+    static void ErrorRecovery() {
+        std::cout << "\n=== Error Recovery Example ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\recovery"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        // Simulate various error conditions
+        std::cout << "1. Python exception:" << std::endl;
+        try {
+            env->ExecutePythonSafely([&]() {
+                env->GetBridge()->ExecuteString("raise ValueError('Test error')");
+                return true;
+            });
+        } catch (const std::exception& e) {
+            std::cout << "   Caught: " << e.what() << std::endl;
+        }
+        
+        std::cout << "2. Thread without registration:" << std::endl;
+        std::thread([env]() {
+            try {
+                env->ExecutePythonSafely([&]() {
+                    env->GetBridge()->ExecuteString("print('Should not work')");
+                    return true;
+                });
+            } catch (const std::exception& e) {
+                std::cout << "   Caught: " << e.what() << std::endl;
+            }
+        }).join();
+        
+        std::cout << "3. Recovery - environment still functional:" << std::endl;
+        env->GetBridge()->ExecuteString("print('   Environment recovered successfully')");
+        
+        DestroyThreadSafePythonEnvironmentManager(manager);
+    }
+};
+
+// Main demonstration
+int main() {
+    try {
+        std::cout << "=== ThreadSafePythonEnvironment Demonstration ===" << std::endl;
+        
+        ThreadSafePythonUsageExamples::BasicUsage();
+        ThreadSafePythonUsageExamples::MultiThreadedProcessing();
+        ThreadSafePythonUsageExamples::CrossThreadFinalization();
+        ThreadSafePythonUsageExamples::ThreadPoolExample();
+        ThreadSafePythonUsageExamples::DebugThreadStates();
+        ThreadSafePythonUsageExamples::ErrorRecovery();
+        
+        std::cout << "\n✓ All examples completed successfully!" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+
+
+//==========
