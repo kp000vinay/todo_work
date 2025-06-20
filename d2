@@ -1437,3 +1437,538 @@ void ProcessDataMultithreaded() {
     DestroyThreadSafePythonEnvironmentManager(manager);
 }
 ```
+
+
+// PythonAwareThread.h - Thread class with automatic GIL management
+#pragma once
+
+#include <thread>
+#include <functional>
+#include <memory>
+#include <atomic>
+#include "PythonThreadStateManager_Fixed.h"
+#include "GILReleaseCallback.h"
+
+// Python-aware thread that automatically manages GIL
+class PythonThread {
+private:
+    std::thread m_thread;
+    std::string m_threadName;
+    std::shared_ptr<ThreadSafePythonEnvironment> m_env;
+    std::atomic<bool> m_registered{false};
+    std::atomic<bool> m_autoRegister{true};
+    mutable std::mutex m_mutex;
+    
+    // GIL state for join/detach operations
+    struct GILState {
+        bool wasHeld = false;
+        int gilState = -1;
+        PyThreadState* threadState = nullptr;
+    };
+    
+public:
+    // Default constructor
+    PythonThread() noexcept = default;
+    
+    // Constructor with environment and name
+    PythonThread(std::shared_ptr<ThreadSafePythonEnvironment> env, 
+                 const std::string& name = "")
+        : m_env(env), m_threadName(name) {}
+    
+    // Thread constructor with automatic registration
+    template<typename Function, typename... Args>
+    PythonThread(std::shared_ptr<ThreadSafePythonEnvironment> env,
+                 const std::string& name,
+                 Function&& f, 
+                 Args&&... args)
+        : m_env(env), m_threadName(name) {
+        
+        m_thread = std::thread([this, func = std::forward<Function>(f), 
+                               args = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+            // Auto-register thread if enabled
+            if (m_autoRegister && m_env) {
+                RegisterThread();
+            }
+            
+            // Execute the function
+            std::apply(func, std::move(args));
+        });
+    }
+    
+    // Move constructor
+    PythonThread(PythonThread&& other) noexcept {
+        std::lock_guard<std::mutex> lock(other.m_mutex);
+        m_thread = std::move(other.m_thread);
+        m_threadName = std::move(other.m_threadName);
+        m_env = std::move(other.m_env);
+        m_registered = other.m_registered.load();
+        m_autoRegister = other.m_autoRegister.load();
+    }
+    
+    // Move assignment
+    PythonThread& operator=(PythonThread&& other) noexcept {
+        if (this != &other) {
+            // Ensure current thread is properly handled
+            if (m_thread.joinable()) {
+                std::terminate();  // Consistent with std::thread
+            }
+            
+            std::lock_guard<std::mutex> lock1(m_mutex);
+            std::lock_guard<std::mutex> lock2(other.m_mutex);
+            
+            m_thread = std::move(other.m_thread);
+            m_threadName = std::move(other.m_threadName);
+            m_env = std::move(other.m_env);
+            m_registered = other.m_registered.load();
+            m_autoRegister = other.m_autoRegister.load();
+        }
+        return *this;
+    }
+    
+    // Destructor
+    ~PythonThread() {
+        if (m_thread.joinable()) {
+            std::terminate();  // Consistent with std::thread behavior
+        }
+    }
+    
+    // Deleted copy operations
+    PythonThread(const PythonThread&) = delete;
+    PythonThread& operator=(const PythonThread&) = delete;
+    
+    // Join with automatic GIL release
+    void join() {
+        if (!m_thread.joinable()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::invalid_argument),
+                "Thread is not joinable"
+            );
+        }
+        
+        GILState gilState = ReleaseGILIfHeld();
+        
+        try {
+            m_thread.join();
+            RestoreGIL(gilState);
+        } catch (...) {
+            RestoreGIL(gilState);
+            throw;
+        }
+    }
+    
+    // Detach with automatic GIL release
+    void detach() {
+        if (!m_thread.joinable()) {
+            throw std::system_error(
+                std::make_error_code(std::errc::invalid_argument),
+                "Thread is not joinable"
+            );
+        }
+        
+        GILState gilState = ReleaseGILIfHeld();
+        
+        try {
+            m_thread.detach();
+            RestoreGIL(gilState);
+        } catch (...) {
+            RestoreGIL(gilState);
+            throw;
+        }
+    }
+    
+    // Check if joinable
+    bool joinable() const noexcept {
+        return m_thread.joinable();
+    }
+    
+    // Get thread ID
+    std::thread::id get_id() const noexcept {
+        return m_thread.get_id();
+    }
+    
+    // Get native handle
+    std::thread::native_handle_type native_handle() {
+        return m_thread.native_handle();
+    }
+    
+    // Swap threads
+    void swap(PythonThread& other) noexcept {
+        std::lock_guard<std::mutex> lock1(m_mutex);
+        std::lock_guard<std::mutex> lock2(other.m_mutex);
+        
+        m_thread.swap(other.m_thread);
+        std::swap(m_threadName, other.m_threadName);
+        std::swap(m_env, other.m_env);
+        
+        bool r1 = m_registered.load();
+        bool r2 = other.m_registered.load();
+        m_registered = r2;
+        other.m_registered = r1;
+        
+        bool a1 = m_autoRegister.load();
+        bool a2 = other.m_autoRegister.load();
+        m_autoRegister = a2;
+        other.m_autoRegister = a1;
+    }
+    
+    // Set auto-registration
+    void SetAutoRegister(bool autoReg) {
+        m_autoRegister = autoReg;
+    }
+    
+    // Get thread name
+    const std::string& GetName() const {
+        return m_threadName;
+    }
+    
+    // Register thread for Python (can be called manually)
+    bool RegisterThread() {
+        if (m_registered.exchange(true)) {
+            return true;  // Already registered
+        }
+        
+        if (!m_env) {
+            return false;
+        }
+        
+        // This must be called from the thread itself
+        if (std::this_thread::get_id() != m_thread.get_id()) {
+            throw std::runtime_error("RegisterThread must be called from the thread itself");
+        }
+        
+        return m_env->RegisterThreadForPython(m_threadName);
+    }
+    
+    // Execute Python code safely on this thread
+    template<typename Func>
+    auto ExecutePython(Func&& func) -> decltype(func()) {
+        if (!m_env) {
+            throw std::runtime_error("No Python environment associated with thread");
+        }
+        
+        if (std::this_thread::get_id() != m_thread.get_id()) {
+            throw std::runtime_error("ExecutePython must be called from the thread itself");
+        }
+        
+        if (!m_registered) {
+            RegisterThread();
+        }
+        
+        return m_env->ExecutePythonSafely(std::forward<Func>(func));
+    }
+    
+    // Static utility functions
+    static unsigned int hardware_concurrency() noexcept {
+        return std::thread::hardware_concurrency();
+    }
+    
+private:
+    GILState ReleaseGILIfHeld() {
+        GILState state;
+        
+        auto* manager = dynamic_cast<PythonThreadStateManagerFixed*>(
+            &GetGlobalThreadStateManager());
+        
+        if (!manager) {
+            return state;
+        }
+        
+        // Check if current thread holds GIL
+        if (manager->m_api.PyGILState_Check) {
+            state.wasHeld = manager->m_api.PyGILState_Check() == 1;
+        }
+        
+        if (state.wasHeld) {
+            if (manager->m_api.PyEval_SaveThread) {
+                // Release GIL
+                state.threadState = manager->m_api.PyEval_SaveThread();
+                LogDebug("GIL released before join/detach");
+            } else if (manager->m_api.PyGILState_Ensure && 
+                      manager->m_api.PyGILState_Release) {
+                // Alternative method
+                state.gilState = manager->m_api.PyGILState_Ensure();
+                manager->m_api.PyGILState_Release(state.gilState);
+                state.wasHeld = true;
+            }
+        }
+        
+        return state;
+    }
+    
+    void RestoreGIL(const GILState& state) {
+        if (!state.wasHeld) {
+            return;
+        }
+        
+        auto* manager = dynamic_cast<PythonThreadStateManagerFixed*>(
+            &GetGlobalThreadStateManager());
+        
+        if (!manager) {
+            return;
+        }
+        
+        if (state.threadState && manager->m_api.PyEval_RestoreThread) {
+            // Restore GIL
+            manager->m_api.PyEval_RestoreThread(state.threadState);
+            LogDebug("GIL restored after join/detach");
+        } else if (state.gilState != -1 && manager->m_api.PyGILState_Ensure) {
+            // Re-ensure GIL
+            manager->m_api.PyGILState_Ensure();
+        }
+    }
+    
+    void LogDebug(const std::string& message) {
+        #ifdef _DEBUG
+        std::cout << "[PythonThread] " << message << std::endl;
+        #endif
+    }
+};
+
+// Convenience factory for creating Python threads
+class PythonThreadFactory {
+private:
+    std::shared_ptr<ThreadSafePythonEnvironment> m_env;
+    std::atomic<int> m_threadCounter{0};
+    
+public:
+    explicit PythonThreadFactory(std::shared_ptr<ThreadSafePythonEnvironment> env)
+        : m_env(env) {}
+    
+    // Create thread with auto-generated name
+    template<typename Function, typename... Args>
+    PythonThread CreateThread(Function&& f, Args&&... args) {
+        std::string name = "PythonWorker" + std::to_string(m_threadCounter++);
+        return PythonThread(m_env, name, std::forward<Function>(f), 
+                           std::forward<Args>(args)...);
+    }
+    
+    // Create thread with custom name
+    template<typename Function, typename... Args>
+    PythonThread CreateNamedThread(const std::string& name, 
+                                  Function&& f, Args&&... args) {
+        return PythonThread(m_env, name, std::forward<Function>(f), 
+                           std::forward<Args>(args)...);
+    }
+    
+    // Create thread pool
+    std::vector<PythonThread> CreateThreadPool(size_t numThreads,
+                                              std::function<void(int)> workerFunc) {
+        std::vector<PythonThread> threads;
+        threads.reserve(numThreads);
+        
+        for (size_t i = 0; i < numThreads; ++i) {
+            threads.emplace_back(m_env, "PoolWorker" + std::to_string(i),
+                               workerFunc, static_cast<int>(i));
+        }
+        
+        return threads;
+    }
+};
+
+// RAII wrapper for multiple threads
+class PythonThreadGroup {
+private:
+    std::vector<PythonThread> m_threads;
+    
+public:
+    PythonThreadGroup() = default;
+    
+    ~PythonThreadGroup() {
+        JoinAll();
+    }
+    
+    // Add thread to group
+    void Add(PythonThread&& thread) {
+        m_threads.push_back(std::move(thread));
+    }
+    
+    // Create and add thread
+    template<typename Function, typename... Args>
+    void EmplaceBack(std::shared_ptr<ThreadSafePythonEnvironment> env,
+                    const std::string& name,
+                    Function&& f, Args&&... args) {
+        m_threads.emplace_back(env, name, std::forward<Function>(f), 
+                              std::forward<Args>(args)...);
+    }
+    
+    // Join all threads (with automatic GIL release)
+    void JoinAll() {
+        for (auto& thread : m_threads) {
+            if (thread.joinable()) {
+                thread.join();  // GIL automatically released!
+            }
+        }
+    }
+    
+    // Detach all threads
+    void DetachAll() {
+        for (auto& thread : m_threads) {
+            if (thread.joinable()) {
+                thread.detach();  // GIL automatically released!
+            }
+        }
+    }
+    
+    size_t Size() const {
+        return m_threads.size();
+    }
+    
+    // Access individual threads
+    PythonThread& operator[](size_t index) {
+        return m_threads[index];
+    }
+    
+    const PythonThread& operator[](size_t index) const {
+        return m_threads[index];
+    }
+};
+
+// Usage examples
+class PythonThreadExamples {
+public:
+    static void BasicExample() {
+        std::cout << "\n=== Python Thread Basic Example ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\test"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        // Create Python-aware thread
+        PythonThread worker(env, "Worker1", [env]() {
+            // Thread is automatically registered
+            env->ExecutePythonSafely([&]() {
+                env->GetBridge()->ExecuteString("print('Worker thread running')");
+            });
+        });
+        
+        // Main thread continues with Python work
+        env->GetBridge()->ExecuteString("print('Main thread working...')");
+        
+        // Join automatically releases GIL!
+        worker.join();  // No deadlock even if main thread holds GIL
+        
+        std::cout << "Worker joined successfully" << std::endl;
+    }
+    
+    static void ThreadPoolExample() {
+        std::cout << "\n=== Python Thread Pool Example ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\test"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        // Create thread factory
+        PythonThreadFactory factory(env);
+        
+        // Create thread pool
+        auto pool = factory.CreateThreadPool(4, [env](int id) {
+            // Process tasks
+            for (int i = 0; i < 3; ++i) {
+                env->ExecutePythonSafely([&]() {
+                    auto bridge = env->GetBridge();
+                    bridge->ExecuteString(
+                        "print(f'Worker " + std::to_string(id) + 
+                        " task " + std::to_string(i) + "')"
+                    );
+                });
+                
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        
+        // Main thread does heavy Python work
+        env->GetBridge()->ExecuteString(R"(
+import time
+print("Main thread doing heavy computation...")
+for i in range(5):
+    # Simulate work
+    result = sum(range(1000000))
+    time.sleep(0.1)
+)");
+        
+        // Join all threads - GIL automatically released for each!
+        for (auto& thread : pool) {
+            thread.join();
+        }
+        
+        std::cout << "All threads joined successfully" << std::endl;
+    }
+    
+    static void ThreadGroupExample() {
+        std::cout << "\n=== Python Thread Group Example ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\test"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        {
+            PythonThreadGroup group;
+            
+            // Add multiple threads
+            for (int i = 0; i < 5; ++i) {
+                group.EmplaceBack(env, "GroupWorker" + std::to_string(i),
+                    [env, i]() {
+                        env->ExecutePythonSafely([&]() {
+                            env->GetBridge()->ExecuteString(
+                                "import time; "
+                                "print(f'Group worker " + std::to_string(i) + " started'); "
+                                "time.sleep(0.5); "
+                                "print(f'Group worker " + std::to_string(i) + " finished')"
+                            );
+                        });
+                    });
+            }
+            
+            // Do other work...
+            env->GetBridge()->ExecuteString("print('Main thread continues...')");
+            
+            // Automatic join all with GIL release when group goes out of scope
+        }  // All threads joined here
+        
+        std::cout << "Thread group completed" << std::endl;
+    }
+    
+    static void DeadlockPreventionExample() {
+        std::cout << "\n=== Deadlock Prevention Example ===" << std::endl;
+        
+        auto manager = CreateThreadSafePythonEnvironmentManager();
+        auto env = std::static_pointer_cast<ThreadSafePythonEnvironment>(
+            manager->GetEnvironment("C:\\Python\\envs\\test"));
+        
+        if (!env->Initialize()) {
+            return;
+        }
+        
+        // This would normally deadlock with std::thread
+        env->ExecutePythonSafely([&]() {
+            std::cout << "Main thread holds GIL" << std::endl;
+            
+            // Create thread that needs GIL
+            PythonThread worker(env, "DeadlockTest", [env]() {
+                std::cout << "Worker waiting for GIL..." << std::endl;
+                
+                env->ExecutePythonSafely([&]() {
+                    env->GetBridge()->ExecuteString("print('Worker got GIL!')");
+                });
+            });
+            
+            // With std::thread, this would deadlock
+            // With PythonThread, GIL is released automatically
+            worker.join();  // Safe! GIL released before join
+            
+            std::cout << "No deadlock!" << std::endl;
+        });
+    }
+};
